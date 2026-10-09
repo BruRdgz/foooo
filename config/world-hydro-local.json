@@ -1,0 +1,9 @@
+{
+  "ibge_state": "pibex_vfinal/data/raw/ibge_uf26.geojson",
+  "ibge_municipalities": "pibex_vfinal/data/raw/ibge_uf26_municipios.geojson",
+  "ibge_names": "pibex_vfinal/data/raw/ibge_uf26_municipios.json",
+  "osm_pbf": "pibex_vfinal/data/raw/nordeste-260930.osm.pbf",
+  "osm_url": "https://download.geofabrik.de/south-america/brazil/nordeste-260930.osm.pbf",
+  "output_dir": "data/world/pe_hydro_v1",
+  "hydro_enabled": true
+}

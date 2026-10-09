@@ -1,0 +1,1735 @@
+<?xml version="1.0" encoding="utf-8"?>
+<model version="NetLogo 7.0.4" snapToGrid="true">
+  <code><![CDATA[extensions [ csv gis ]
+
+globals [
+  day-count
+  max-days
+
+  num-farms
+
+  total-infections
+  total-deaths
+  total-culled
+  cumulative-cost
+  current-rt
+  exposed-history
+
+  log-file-name
+
+  selected-farm
+
+  gis-dataset-limite        ;; poligono do limite de Pernambuco
+  gis-dataset-hidrografia   ;; rios / acudes / corpos d'agua
+  gis-dataset-granjas       ;; pontos das granjas (import via shapefile)
+]
+
+breed [farms farm]
+breed [birds bird]
+breed [trucks truck]
+
+farms-own [
+  farm-id
+  pop-total
+  susceptible
+  exposed
+  infected
+  recovered
+  dead
+  biosecurity
+
+  notified?
+  first-infection-day
+  detection-day
+  reaction-day
+
+  quarantined?
+  culled?
+  under-biosec-boost?
+
+  new-exposed-today
+]
+
+birds-own [
+  bird-state
+  days-infected
+]
+
+trucks-own [
+  contaminated?
+  days-contaminated
+  at-farm
+]
+
+patches-own [
+  water?
+]
+
+;; =====================================================================
+;; SETUP
+;; =====================================================================
+to setup
+  clear-all
+
+  set day-count 0
+  set max-days min list 365 (simulation-duration-months * 30)
+
+  set total-infections 0
+  set total-deaths 0
+  set total-culled 0
+  set cumulative-cost 0
+  set current-rt 0
+  set exposed-history []
+  set selected-farm nobody
+  set num-farms 0
+
+  setup-log
+
+  ;; carrega a base cartografica ANTES de tudo, pois define o
+  ;; sistema de coordenadas (envelope) que todo o resto vai usar
+  setup-gis-environment
+
+  ifelse importar-granjas-shp? [
+    import-farms-gis
+  ] [
+    ifelse importar-arquivo? [
+      import-farms
+    ] [
+      setup-default-farms
+    ]
+  ]
+
+  setup-water-points
+  setup-birds
+  setup-trucks
+  seed-initial-outbreak
+
+  update-visuals
+  reset-ticks
+end
+
+;; ---------------------------------------------------------------------
+;; NOVA: carrega camadas GIS e define a transformacao de coordenadas
+;; ---------------------------------------------------------------------
+to setup-gis-environment
+  set gis-dataset-limite nobody
+  set gis-dataset-hidrografia nobody
+
+  ifelse enable-gis-map? [
+    user-message "Selecione o arquivo .shp do LIMITE ESTADUAL de Pernambuco (ex: PE_UF_2025.shp)."
+    let path-limite user-file
+    ifelse path-limite != false [
+      set gis-dataset-limite gis:load-dataset path-limite
+      gis:set-world-envelope (gis:envelope-of gis-dataset-limite)
+      gis:set-drawing-color gray - 2
+      gis:draw gis-dataset-limite 2
+    ] [
+      user-message "Nenhum arquivo selecionado para o limite. Usando envelope aproximado de PE."
+      gis:set-world-envelope (list -41.4 -34.8 -9.5 -7.1)
+    ]
+
+    user-message "Selecione o arquivo .shp da HIDROGRAFIA de PE (clique Cancelar se ainda nao tiver)."
+    let path-hidro user-file
+    if path-hidro != false [
+      set gis-dataset-hidrografia gis:load-dataset path-hidro
+      gis:set-drawing-color (list 30 90 200)
+      gis:draw gis-dataset-hidrografia 1
+    ]
+  ] [
+    ;; mapa GIS desligado: ainda define um envelope aproximado para
+    ;; que import-farms (lat/lon) continue funcionando corretamente
+    gis:set-world-envelope (list -41.4 -34.8 -9.5 -7.1)
+  ]
+end
+
+to setup-default-farms
+  let i 0
+  create-farms num-farms-default [
+    place-in-pe-polygon
+
+    set farm-id i + 1
+    set pop-total population-per-farm
+    set susceptible pop-total
+    set exposed 0
+    set infected 0
+    set recovered 0
+    set dead 0
+
+    set biosecurity base-biosecurity + (random 21) - 10
+    if biosecurity < 0 [ set biosecurity 0 ]
+    if biosecurity > 100 [ set biosecurity 100 ]
+
+    set notified? false
+    set first-infection-day -1
+    set detection-day -1
+    set reaction-day -1
+    set quarantined? false
+    set culled? false
+    set under-biosec-boost? false
+    set new-exposed-today 0
+
+    set shape "house"
+    set size 2.5
+    set color green
+
+    set i i + 1
+  ]
+  set num-farms num-farms-default
+end
+
+;; ---------------------------------------------------------------------
+;; CSV agora traz LAT/LON reais em vez de x/y arbitrarios
+;; Formato esperado do CSV: id, lat, lon, pop_total, biosseguranca
+;; ---------------------------------------------------------------------
+to import-farms
+  let path user-file
+  ifelse path = false [
+    user-message "Nenhum arquivo selecionado. Usando granjas padrao."
+    setup-default-farms
+  ] [
+    let rows csv:from-file path
+    set rows but-first rows
+    let n 0
+    foreach rows [ row ->
+      let lat item 1 row
+      let lon item 2 row
+      let loc gis:project-lat-lon lat lon
+
+      ifelse not empty? loc [
+        create-farms 1 [
+          set farm-id item 0 row
+          setxy (item 0 loc) (item 1 loc)
+          set pop-total item 3 row
+          set susceptible pop-total
+          set exposed 0
+          set infected 0
+          set recovered 0
+          set dead 0
+          set biosecurity item 4 row
+
+          set notified? false
+          set first-infection-day -1
+          set detection-day -1
+          set reaction-day -1
+          set quarantined? false
+          set culled? false
+          set under-biosec-boost? false
+          set new-exposed-today 0
+
+          set shape "house"
+          set size 2.5
+          set color green
+        ]
+        set n n + 1
+      ] [
+        log-event "AVISO_IMPORTACAO" (word "Granja " (item 0 row) " fora dos limites de PE - ignorada")
+      ]
+    ]
+    set num-farms n
+    user-message (word "Importadas " n " granjas georreferenciadas do arquivo.")
+  ]
+end
+
+;; ---------------------------------------------------------------------
+;; importa granjas direto de um shapefile de pontos
+;; Shapefile esperado com atributos: ID, POP_TOTAL, BIOSEG
+;; ---------------------------------------------------------------------
+to import-farms-gis
+  let path user-file
+  ifelse path = false [
+    user-message "Nenhum arquivo selecionado. Usando granjas padrao."
+    setup-default-farms
+  ] [
+    set gis-dataset-granjas gis:load-dataset path
+
+    gis:create-turtles-from-points-manual gis-dataset-granjas farms
+      [["ID" "farm-id"] ["POP_TOTAL" "pop-total"] ["BIOSEG" "biosecurity"]]
+    [
+      set susceptible pop-total
+      set exposed 0
+      set infected 0
+      set recovered 0
+      set dead 0
+
+      set notified? false
+      set first-infection-day -1
+      set detection-day -1
+      set reaction-day -1
+      set quarantined? false
+      set culled? false
+      set under-biosec-boost? false
+      set new-exposed-today 0
+
+      set shape "house"
+      set size 2.5
+      set color green
+    ]
+
+    set num-farms count farms
+    user-message (word "Importadas " num-farms " granjas do shapefile.")
+  ]
+end
+
+;; ---------------------------------------------------------------------
+;; usa hidrografia real em vez de pontos aleatorios
+;; ---------------------------------------------------------------------
+to setup-water-points
+  ask patches [ set water? false ]
+
+  ifelse enable-bird-layer? and gis-dataset-hidrografia != nobody and gis-dataset-limite != nobody [
+    ;; primeiro restringe aos patches que estao DENTRO do poligono real de PE
+    ;; (o envelope e um retangulo que tambem pega pedacos de estados vizinhos,
+    ;; entao sem esse filtro os rios da PB/AL/BA tambem contariam)
+    let patches-pe patches gis:intersecting gis-dataset-limite
+    let patches-agua patches-pe gis:intersecting gis-dataset-hidrografia
+    ask patches-agua [
+      set water? true
+    ]
+  ] [
+    if number-of-water-points > 0 [
+      ask n-of number-of-water-points patches with [not any? farms-here] [
+        set water? true
+        set pcolor blue - 1
+      ]
+    ]
+  ]
+end
+
+;; ---------------------------------------------------------------------
+;; aves nascem dentro do poligono de Pernambuco
+;; ---------------------------------------------------------------------
+to setup-birds
+  if enable-bird-layer? [
+    create-birds number-of-birds [
+      place-in-pe-polygon
+      set shape "bird"
+      set size 1.2
+      set bird-state "S"
+      set color white
+      set days-infected 0
+      if random-float 100 < initial-bird-infection-pct [
+        set bird-state "I"
+        set color orange
+      ]
+    ]
+  ]
+end
+
+;; turtle procedure generica: posiciona QUALQUER turtle (ave ou granja)
+;; dentro do poligono real de PE, se o shapefile do limite estiver
+;; carregado; senao usa posicao aleatoria no mundo (comportamento antigo)
+to place-in-pe-polygon
+  ifelse gis-dataset-limite != nobody [
+    let limite-feature first gis:feature-list-of gis-dataset-limite
+    let pt gis:random-point-inside limite-feature
+    let loc gis:location-of pt
+    ifelse not empty? loc [
+      setxy (item 0 loc) (item 1 loc)
+    ] [
+      setxy random-xcor random-ycor
+    ]
+  ] [
+    setxy random-xcor random-ycor
+  ]
+end
+
+to setup-trucks
+  if enable-fomite-layer? and any? farms [
+    create-trucks number-of-trucks [
+      set shape "truck"
+      set size 1.5
+      set color gray
+      set contaminated? false
+      set days-contaminated 0
+      set at-farm one-of farms
+      move-to at-farm
+    ]
+  ]
+end
+
+to seed-initial-outbreak
+  if any? farms [
+    ask one-of farms [
+      let seed min list susceptible initial-infected
+      set susceptible susceptible - seed
+      set exposed exposed + seed
+      set first-infection-day 0
+      set detection-day (random (detection-time-max + 1))
+      log-event "INTRODUCAO_INICIAL" (word "Granja " farm-id ": foco inicial com " seed " aves expostas")
+    ]
+  ]
+end
+
+to setup-log
+  set log-file-name "h5n1_simulacao_log.csv"
+  if file-exists? log-file-name [ file-delete log-file-name ]
+  file-open log-file-name
+  file-print csv:to-row (list "dia" "tipo_evento" "detalhes")
+  file-close
+end
+
+to log-event [tipo detalhes]
+  file-open log-file-name
+  file-print csv:to-row (list day-count tipo detalhes)
+  file-close
+end
+
+;; =====================================================================
+;; GO
+;; =====================================================================
+to go
+  if day-count >= max-days [
+    user-message "Simulação concluída: duração máxima atingida."
+    stop
+  ]
+
+  set day-count day-count + 1
+  ask farms [ set new-exposed-today 0 ]
+
+  intra-farm-transmission
+
+  if enable-bird-layer? [
+    move-birds
+    bird-to-farm-transmission
+  ]
+
+  if enable-fomite-layer? [
+    move-trucks
+  ]
+
+  update-detection
+  update-reaction
+  update-economic-cost
+  update-rt
+  update-visuals
+
+  tick
+end
+
+to intra-farm-transmission
+  ask farms with [not culled?] [
+    let n pop-total
+    if n > 0 [
+
+      let effective-beta beta * (1 - (biosecurity / 100))
+      let sigma (1 / incubation-days)
+      let gamma (1 / infectious-period-days)
+
+      let force-of-infection (effective-beta * infected / n)
+      let new-exp (susceptible * force-of-infection)
+      if new-exp > susceptible [ set new-exp susceptible ]
+
+      let new-inf (exposed * sigma)
+      if new-inf > exposed [ set new-inf exposed ]
+
+      let leaving-infected (infected * gamma)
+      if leaving-infected > infected [ set leaving-infected infected ]
+      let new-dead (leaving-infected * (mortality-rate / 100))
+      let new-recovered (leaving-infected - new-dead)
+
+      set susceptible susceptible - new-exp
+      set exposed exposed + new-exp - new-inf
+      set infected infected + new-inf - leaving-infected
+      set recovered recovered + new-recovered
+      set dead dead + new-dead
+
+      set new-exposed-today new-exposed-today + new-exp
+      set total-infections total-infections + new-exp
+      set total-deaths total-deaths + new-dead
+
+      if new-exp > 0.5 [
+        log-event "INFECCAO" (word "Granja " farm-id ": +" (precision new-exp 1) " aves expostas (intra-granja)")
+      ]
+
+      if new-exp > 0 and first-infection-day = -1 [
+        set first-infection-day day-count
+        set detection-day day-count + (random (detection-time-max + 1))
+        log-event "PRIMEIRA_EXPOSICAO" (word "Granja " farm-id " teve primeira exposição")
+      ]
+    ]
+  ]
+end
+
+to move-birds
+  ask birds [
+    if bird-state = "I" [
+      set days-infected days-infected + 1
+      if days-infected > bird-infection-duration [ die ]
+    ]
+  ]
+  ask birds [
+    ifelse any? patches with [water?] and random-float 100 < 60 [
+      face min-one-of patches with [water?] [distance myself]
+      fd 1
+    ] [
+      rt random 360
+      fd 1
+    ]
+  ]
+end
+
+to bird-to-farm-transmission
+  ask farms with [not culled? and not quarantined?] [
+    let nearby-infected-birds birds with [bird-state = "I" and distance myself <= 3]
+    let near-water any? patches in-radius 3 with [water?]
+    if any? nearby-infected-birds and susceptible > 0 [
+      let prob infection-prob-bird-to-farm
+      if near-water [ set prob prob * 1.5 ]
+      if prob > 100 [ set prob 100 ]
+      if random-float 100 < prob [
+        let seed min list susceptible seed-size-birds
+        set susceptible susceptible - seed
+        set exposed exposed + seed
+        set new-exposed-today new-exposed-today + seed
+        set total-infections total-infections + seed
+        log-event "INTRODUCAO_AVES_MIGRATORIAS" (word "Granja " farm-id ": exposição via aves/água (+" seed ")")
+        if first-infection-day = -1 [
+          set first-infection-day day-count
+          set detection-day day-count + (random (detection-time-max + 1))
+        ]
+      ]
+    ]
+  ]
+end
+
+to move-trucks
+  ask trucks [
+    if contaminated? [
+      set days-contaminated days-contaminated + 1
+      if days-contaminated > fomite-survival-days [
+        set contaminated? false
+        set days-contaminated 0
+      ]
+    ]
+
+    if at-farm != nobody [
+      truck-visit-farm
+    ]
+
+    let candidatos farms with [not culled?]
+    if any? candidatos [
+      let next-farm one-of candidatos
+      set at-farm next-farm
+      move-to next-farm
+      set color ifelse-value contaminated? [red] [gray]
+    ]
+  ]
+end
+
+to truck-visit-farm
+  let f at-farm
+  let truck-is-contaminated? contaminated?
+  let farm-is-quarantined? [quarantined?] of f
+  let farm-is-infected? ([infected] of f > 0)
+
+  if not farm-is-quarantined? and truck-is-contaminated? [
+    ask f [
+      if susceptible > 0 and random-float 100 < infection-prob-truck-to-farm [
+        let seed min list susceptible seed-size-fomite
+        set susceptible susceptible - seed
+        set exposed exposed + seed
+        set new-exposed-today new-exposed-today + seed
+        set total-infections total-infections + seed
+        log-event "INTRODUCAO_FOMITE" (word "Granja " farm-id ": exposição via caminhão/fômite (+" seed ")")
+        if first-infection-day = -1 [
+          set first-infection-day day-count
+          set detection-day day-count + (random (detection-time-max + 1))
+        ]
+      ]
+    ]
+  ]
+
+  if not farm-is-quarantined? and farm-is-infected? [
+    set contaminated? true
+    set days-contaminated 0
+  ]
+end
+
+to update-detection
+  ask farms with [not notified? and first-infection-day > -1 and (infected > 0 or exposed > 0)] [
+    if day-count >= detection-day [
+      set notified? true
+      set reaction-day day-count + (random (reaction-time-max + 1))
+      log-event "DETECCAO" (word "Granja " farm-id " notificada às autoridades")
+    ]
+  ]
+end
+
+to update-reaction
+  ask farms with [notified? and not quarantined? and not culled?] [
+    if day-count >= reaction-day [
+      set quarantined? true
+      log-event "REACAO_AUTOMATICA" (word "Granja " farm-id ": bloqueio de movimentação automático aplicado")
+    ]
+  ]
+end
+
+to select-farm-with-mouse
+  if mouse-inside? [
+    let mx mouse-xcor
+    let my mouse-ycor
+    if any? farms [
+      let nearest min-one-of farms [ distancexy mx my ]
+      if nearest != nobody [
+        set selected-farm nearest
+      ]
+    ]
+  ]
+end
+
+to-report selected-farm-label
+  ifelse selected-farm = nobody [
+    report "Nenhuma granja selecionada"
+  ] [
+    report (word "Granja " [farm-id] of selected-farm)
+  ]
+end
+
+to apply-intervention-selected
+  if selected-farm != nobody [
+    ask selected-farm [
+      if not culled? [
+        if intervention-type = "Sacrificio Sanitario" [ apply-stamping-out ]
+        if intervention-type = "Bloqueio de Movimentacao" [ apply-movement-block ]
+        if intervention-type = "Melhoria de Biosseguranca" [ apply-biosecurity-boost ]
+      ]
+    ]
+  ]
+end
+
+to apply-stamping-out
+  let cull-count (susceptible + exposed + infected)
+  set cumulative-cost cumulative-cost + (cull-count * cull-cost-per-bird)
+  set total-culled total-culled + cull-count
+  set susceptible 0
+  set exposed 0
+  set infected 0
+  set culled? true
+  set quarantined? true
+  set color black
+  log-event "SACRIFICIO_SANITARIO" (word "Granja " farm-id ": " (precision cull-count 0) " aves sacrificadas")
+
+  ask farms in-radius stamping-out-radius with [self != myself and not culled?] [
+    set quarantined? true
+    log-event "QUARENTENA_PERIFERICA" (word "Granja " farm-id ": quarentena por raio de sacrifício")
+  ]
+end
+
+to apply-movement-block
+  set quarantined? true
+  log-event "BLOQUEIO_MOVIMENTACAO" (word "Granja " farm-id ": movimentação de caminhões suspensa manualmente")
+end
+
+to apply-biosecurity-boost
+  set biosecurity min list 100 (biosecurity + biosecurity-boost-amount)
+  set cumulative-cost cumulative-cost + biosecurity-investment-cost
+  set under-biosec-boost? true
+  log-event "MELHORIA_BIOSSEGURANCA" (word "Granja " farm-id ": biosseguridade elevada para " biosecurity "%")
+end
+
+to update-economic-cost
+  ask farms with [quarantined? and not culled?] [
+    set cumulative-cost cumulative-cost + quarantine-cost-per-day
+  ]
+end
+
+to update-rt
+  let infections-now sum [new-exposed-today] of farms
+  set exposed-history lput infections-now exposed-history
+
+  let hist-len length exposed-history
+  ifelse hist-len > generation-interval-days [
+    let infections-past item (hist-len - 1 - generation-interval-days) exposed-history
+    ifelse infections-past > 0 [
+      set current-rt infections-now / infections-past
+    ] [
+      set current-rt 0
+    ]
+  ] [
+    set current-rt 0
+  ]
+end
+
+to update-visuals
+  ask farms [
+    ifelse culled? [
+      set color black
+    ] [
+      ifelse infected > 0 or exposed > 0 [
+        ifelse notified? [ set color red ] [ set color orange ]
+      ] [
+        ifelse quarantined? [ set color yellow ] [ set color green ]
+      ]
+    ]
+  ]
+end
+
+to-report healthy-farms-count
+  report count farms with [not culled? and infected = 0 and exposed = 0]
+end
+
+to-report notified-infected-farms-count
+  report count farms with [notified? and (infected > 0 or exposed > 0)]
+end
+
+to-report hidden-infected-farms-count
+  report count farms with [not notified? and (infected > 0 or exposed > 0)]
+end
+
+to-report total-dead-birds
+  report sum [dead] of farms
+end
+
+to-report total-culled-birds
+  report total-culled
+end
+
+to-report cumulative-cost-brl
+  report cumulative-cost
+end
+
+to-report days-remaining
+  report max-days - day-count
+end
+]]></code>
+  <widgets>
+    <view x="368" wrappingAllowedX="false" y="10" frameRate="30.0" minPycor="-50" height="304" showTickCounter="true" patchSize="3.0" fontSize="10" wrappingAllowedY="false" width="840" tickCounterLabel="ticks" maxPycor="50" updateMode="0" maxPxcor="140" minPxcor="-140"></view>
+    <slider x="5" step="5" y="60" max="100" width="160" display="base-biosecurity" height="50" min="0" direction="Horizontal" default="50.0" variable="base-biosecurity"></slider>
+    <slider x="5" step="10" y="5" max="200" width="160" display="num-farms-default" height="50" min="10" direction="Horizontal" default="50.0" variable="num-farms-default"></slider>
+    <slider x="170" step="500" y="5" max="20000" width="185" display="population-per-farm" height="50" min="500" direction="Horizontal" default="5000.0" variable="population-per-farm"></slider>
+    <slider x="170" step="10" y="60" max="500" width="185" display="initial-infected" height="50" min="1" direction="Horizontal" default="50.0" variable="initial-infected"></slider>
+    <slider x="170" step="1" y="115" max="14" width="185" display="incubation-days" height="50" min="1" direction="Horizontal" default="4.0" variable="incubation-days"></slider>
+    <slider x="5" step="0.1" y="115" max="5.0" width="160" display="beta" height="50" min="0.5" direction="Horizontal" default="3.2" variable="beta"></slider>
+    <slider x="5" step="1" y="225" max="30" width="160" display="detection-time-max" height="50" min="1" direction="Horizontal" default="7.0" variable="detection-time-max"></slider>
+    <slider x="170" step="5" y="170" max="100" width="185" display="mortality-rate" height="50" min="50" direction="Horizontal" default="90.0" variable="mortality-rate"></slider>
+    <slider x="5" step="1" y="170" max="10" width="160" display="infectious-period-days" height="50" min="1" direction="Horizontal" default="3.0" variable="infectious-period-days"></slider>
+    <slider x="170" step="1" y="225" max="14" width="185" display="reaction-time-max" height="50" min="0" direction="Horizontal" default="3.0" variable="reaction-time-max"></slider>
+    <slider x="170" step="5" y="280" max="100" width="185" display="number-of-birds" height="50" min="0" direction="Horizontal" default="20.0" variable="number-of-birds"></slider>
+    <slider x="5" step="1" y="280" max="12" width="160" display="simulation-duration-months" height="50" min="1" direction="Horizontal" default="6.0" variable="simulation-duration-months"></slider>
+    <slider x="5" step="5" y="335" max="50" width="160" display="initial-bird-infection-pct" height="50" min="0" direction="Horizontal" default="10.0" variable="initial-bird-infection-pct"></slider>
+    <slider x="170" step="1" y="335" max="14" width="185" display="bird-infection-duration" height="50" min="1" direction="Horizontal" default="5.0" variable="bird-infection-duration"></slider>
+    <slider x="5" step="5" y="390" max="100" width="160" display="infection-prob-bird-to-farm" height="50" min="0" direction="Horizontal" default="15.0" variable="infection-prob-bird-to-farm"></slider>
+    <slider x="170" step="5" y="390" max="100" width="185" display="seed-size-birds" height="50" min="1" direction="Horizontal" default="10.0" variable="seed-size-birds"></slider>
+    <slider x="170" step="1" y="445" max="30" width="185" display="number-of-trucks" height="50" min="0" direction="Horizontal" default="5.0" variable="number-of-trucks"></slider>
+    <slider x="5" step="1" y="445" max="30" width="160" display="number-of-water-points" height="50" min="0" direction="Horizontal" default="8.0" variable="number-of-water-points"></slider>
+    <slider x="365" step="5" y="335" max="100" width="160" display="infection-prob-truck-to-farm" height="50" min="0" direction="Horizontal" default="20.0" variable="infection-prob-truck-to-farm"></slider>
+    <slider x="530" step="5" y="335" max="100" width="165" display="seed-size-fomite" height="50" min="1" direction="Horizontal" default="15.0" variable="seed-size-fomite"></slider>
+    <slider x="530" step="1" y="390" max="15" width="165" display="stamping-out-radius" height="50" min="1" direction="Horizontal" default="5.0" variable="stamping-out-radius"></slider>
+    <slider x="365" step="1" y="390" max="14" width="160" display="fomite-survival-days" height="50" min="1" direction="Horizontal" default="5.0" variable="fomite-survival-days"></slider>
+    <slider x="365" step="1" y="445" max="100" width="160" display="cull-cost-per-bird" height="50" min="0" direction="Horizontal" default="8.0" variable="cull-cost-per-bird"></slider>
+    <slider x="530" step="100" y="445" max="5000" width="165" display="quarantine-cost-per-day" height="50" min="0" direction="Horizontal" default="500.0" variable="quarantine-cost-per-day"></slider>
+    <slider x="1220" step="5" y="5" max="50" width="150" display="biosecurity-boost-amount" height="50" min="5" direction="Horizontal" default="20.0" variable="biosecurity-boost-amount"></slider>
+    <slider x="1375" step="500" y="5" max="20000" width="150" display="biosecurity-investment-cost" height="50" min="0" direction="Horizontal" default="5000.0" variable="biosecurity-investment-cost"></slider>
+    <switch x="1220" y="60" height="40" on="true" variable="enable-bird-layer?" width="95" display="enable-bird-layer?"></switch>
+    <switch x="1320" y="60" height="40" on="true" variable="enable-fomite-layer?" width="100" display="enable-fomite-layer?"></switch>
+    <switch x="1425" y="60" height="40" on="false" variable="importar-arquivo?" width="130" display="importar-arquivo?"></switch>
+    <switch x="1560" y="60" height="40" on="true" variable="enable-gis-map?" width="120" display="enable-gis-map?"></switch>
+    <chooser x="1220" y="110" height="60" variable="intervention-type" current="0" width="250" display="intervention-type">
+      <choice type="string" value="Sacrificio Sanitario"></choice>
+      <choice type="string" value="Bloqueio de Movimentacao"></choice>
+      <choice type="string" value="Melhoria de Biosseguranca"></choice>
+    </chooser>
+    <switch x="1480" y="120" height="40" on="true" variable="importar-granjas-shp?" width="150" display="importar-granjas-shp?"></switch>
+    <slider x="1530" step="1" y="5" max="10" width="150" display="generation-interval-days" height="50" min="1" direction="Horizontal" default="5.0" variable="generation-interval-days"></slider>
+    <button x="1220" y="180" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="75" display="Configurar">setup</button>
+    <plot x="1455" autoPlotX="true" yMax="10.0" autoPlotY="true" yAxis="Custo Acumulado (R$)" y="360" xMin="0.0" height="175" legend="true" xMax="10.0" yMin="0.0" width="230" xAxis="Dias" display="Impacto Economico">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="custo" color="-13345367" legend="true">
+        <setup></setup>
+        <update>plot cumulative-cost</update>
+      </pen>
+    </plot>
+    <plot x="1220" autoPlotX="true" yMax="10.0" autoPlotY="true" yAxis="Numero de Granjas" y="360" xMin="0.0" height="175" legend="true" xMax="10.0" yMin="0.0" width="230" xAxis="Dias" display="Curva Epidemiologica">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="saudaveis" color="-13840069" legend="true">
+        <setup></setup>
+        <update>plot healthy-farms-count</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="notificadas" color="-2674135" legend="true">
+        <setup></setup>
+        <update>plot notified-infected-farms-count</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="ocultas" color="-955883" legend="true">
+        <setup></setup>
+        <update>plot hidden-infected-farms-count</update>
+      </pen>
+    </plot>
+    <monitor x="1535" precision="17" y="295" height="60" fontSize="11" width="100" display="Granjas Notificadas">notified-infected-farms-count</monitor>
+    <monitor x="1430" precision="17" y="295" height="60" fontSize="11" width="100" display="Granjas Saudáveis">healthy-farms-count</monitor>
+    <monitor x="1325" precision="17" y="295" height="60" fontSize="11" width="100" display="Custo Acumulado (R$)">cumulative-cost-brl</monitor>
+    <monitor x="1220" precision="17" y="295" height="60" fontSize="11" width="100" display="Total de Aves Sacrificadas">total-culled-birds</monitor>
+    <monitor x="1640" precision="17" y="230" height="60" fontSize="11" width="100" display="Total de Aves Mortas">total-dead-birds</monitor>
+    <monitor x="1535" precision="17" y="230" height="60" fontSize="11" width="100" display="Rt (Taxa de Propagação)">current-rt</monitor>
+    <monitor x="1430" precision="17" y="230" height="60" fontSize="11" width="100" display="Granja Selecionada">selected-farm-label</monitor>
+    <monitor x="1325" precision="17" y="230" height="60" fontSize="11" width="100" display="Dias Restantes">days-remaining</monitor>
+    <monitor x="1220" precision="17" y="230" height="60" fontSize="11" width="100" display="Dia">day-count</monitor>
+    <button x="1600" y="180" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="125" display="Aplicar Intervenção Selecionada">apply-intervention-selected</button>
+    <button x="1470" y="180" height="40" disableUntilTicks="false" forever="true" kind="Observer" width="120" display="Selecionar Granja">select-farm-with-mouse</button>
+    <button x="1380" y="180" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="80" display="Passo Único">go</button>
+    <button x="1300" y="180" height="40" disableUntilTicks="false" forever="true" kind="Observer" width="71" display="Rodar">go</button>
+    <monitor x="1640" precision="17" y="295" height="60" fontSize="11" width="100" display="Granjas Ocultas">hidden-infected-farms-count</monitor>
+    <plot x="985" autoPlotX="true" yMax="5.0" autoPlotY="false" yAxis="Rt" y="360" xMin="0.0" height="175" legend="true" xMax="10.0" yMin="0.0" width="230" xAxis="Dias" display="Taxa de Propagacao Rt">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="rt" color="-5825686" legend="true">
+        <setup></setup>
+        <update>plot current-rt</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="limiar" color="-5987164" legend="true">
+        <setup></setup>
+        <update>plot 1</update>
+      </pen>
+    </plot>
+  </widgets>
+  <info>## WHAT IS IT?
+
+(a general understanding of what the model is trying to show or explain)
+
+## HOW IT WORKS
+
+(what rules the agents use to create the overall behavior of the model)
+
+## HOW TO USE IT
+
+(how to use the model, including a description of each of the items in the Interface tab)
+
+## THINGS TO NOTICE
+
+(suggested things for the user to notice while running the model)
+
+## THINGS TO TRY
+
+(suggested things for the user to try to do (move sliders, switches, etc.) with the model)
+
+## EXTENDING THE MODEL
+
+(suggested things to add or change in the Code tab to make the model more complicated, detailed, accurate, etc.)
+
+## NETLOGO FEATURES
+
+(interesting or unusual features of NetLogo that the model uses, particularly in the Code tab; or where workarounds were needed for missing features)
+
+## RELATED MODELS
+
+(models in the NetLogo Models Library and elsewhere which are of related interest)
+
+## CREDITS AND REFERENCES
+
+(a reference to the model's URL on the web if it has one, as well as any other necessary credits, citations, and links)
+</info>
+  <turtleShapes>
+    <shape name="default" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="5"></point>
+        <point x="40" y="250"></point>
+        <point x="150" y="205"></point>
+        <point x="260" y="250"></point>
+      </polygon>
+    </shape>
+    <shape name="airplane" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="135" y="15"></point>
+        <point x="120" y="60"></point>
+        <point x="120" y="105"></point>
+        <point x="15" y="165"></point>
+        <point x="15" y="195"></point>
+        <point x="120" y="180"></point>
+        <point x="135" y="240"></point>
+        <point x="105" y="270"></point>
+        <point x="120" y="285"></point>
+        <point x="150" y="270"></point>
+        <point x="180" y="285"></point>
+        <point x="210" y="270"></point>
+        <point x="165" y="240"></point>
+        <point x="180" y="180"></point>
+        <point x="285" y="195"></point>
+        <point x="285" y="165"></point>
+        <point x="180" y="105"></point>
+        <point x="180" y="60"></point>
+        <point x="165" y="15"></point>
+      </polygon>
+    </shape>
+    <shape name="arrow" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="0" y="150"></point>
+        <point x="105" y="150"></point>
+        <point x="105" y="293"></point>
+        <point x="195" y="293"></point>
+        <point x="195" y="150"></point>
+        <point x="300" y="150"></point>
+      </polygon>
+    </shape>
+    <shape name="bird" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="165"></point>
+        <point x="90" y="270"></point>
+        <point x="120" y="300"></point>
+        <point x="180" y="300"></point>
+        <point x="210" y="270"></point>
+        <point x="165" y="165"></point>
+      </polygon>
+      <rectangle endX="180" startY="105" marked="true" color="-1920102913" endY="237" startX="120" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="105"></point>
+        <point x="120" y="75"></point>
+        <point x="105" y="45"></point>
+        <point x="121" y="6"></point>
+        <point x="167" y="8"></point>
+        <point x="207" y="25"></point>
+        <point x="257" y="46"></point>
+        <point x="180" y="75"></point>
+        <point x="165" y="105"></point>
+      </polygon>
+      <circle x="128" y="21" marked="false" color="255" diameter="42" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="163" y="116"></point>
+        <point x="194" y="92"></point>
+        <point x="212" y="86"></point>
+        <point x="230" y="86"></point>
+        <point x="250" y="90"></point>
+        <point x="265" y="98"></point>
+        <point x="279" y="111"></point>
+        <point x="290" y="126"></point>
+        <point x="296" y="143"></point>
+        <point x="298" y="158"></point>
+        <point x="298" y="166"></point>
+        <point x="296" y="183"></point>
+        <point x="286" y="204"></point>
+        <point x="272" y="219"></point>
+        <point x="259" y="227"></point>
+        <point x="235" y="240"></point>
+        <point x="241" y="223"></point>
+        <point x="250" y="207"></point>
+        <point x="251" y="192"></point>
+        <point x="245" y="180"></point>
+        <point x="232" y="168"></point>
+        <point x="216" y="162"></point>
+        <point x="200" y="162"></point>
+        <point x="186" y="166"></point>
+        <point x="175" y="173"></point>
+        <point x="171" y="180"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="137" y="116"></point>
+        <point x="106" y="92"></point>
+        <point x="88" y="86"></point>
+        <point x="70" y="86"></point>
+        <point x="50" y="90"></point>
+        <point x="35" y="98"></point>
+        <point x="21" y="111"></point>
+        <point x="10" y="126"></point>
+        <point x="4" y="143"></point>
+        <point x="2" y="158"></point>
+        <point x="2" y="166"></point>
+        <point x="4" y="183"></point>
+        <point x="14" y="204"></point>
+        <point x="28" y="219"></point>
+        <point x="41" y="227"></point>
+        <point x="65" y="240"></point>
+        <point x="59" y="223"></point>
+        <point x="50" y="207"></point>
+        <point x="49" y="192"></point>
+        <point x="55" y="180"></point>
+        <point x="68" y="168"></point>
+        <point x="84" y="162"></point>
+        <point x="100" y="162"></point>
+        <point x="114" y="166"></point>
+        <point x="125" y="173"></point>
+        <point x="129" y="180"></point>
+      </polygon>
+    </shape>
+    <shape name="box" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="285"></point>
+        <point x="285" y="225"></point>
+        <point x="285" y="75"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="135"></point>
+        <point x="15" y="75"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="75"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="75"></point>
+        <point x="15" y="225"></point>
+        <point x="150" y="285"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <line endX="150" startY="285" marked="false" color="255" endY="135" startX="150"></line>
+      <line endX="15" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+      <line endX="285" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+    </shape>
+    <shape name="bug" rotatable="true" editableColorIndex="0">
+      <circle x="96" y="182" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="110" y="127" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <circle x="110" y="75" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <line endX="80" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+      <line endX="220" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+    </shape>
+    <shape name="butterfly" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="209" y="199"></point>
+        <point x="225" y="225"></point>
+        <point x="225" y="255"></point>
+        <point x="195" y="270"></point>
+        <point x="165" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="89" y="198"></point>
+        <point x="75" y="225"></point>
+        <point x="75" y="255"></point>
+        <point x="105" y="270"></point>
+        <point x="135" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="139" y="148"></point>
+        <point x="100" y="105"></point>
+        <point x="55" y="90"></point>
+        <point x="25" y="90"></point>
+        <point x="10" y="105"></point>
+        <point x="10" y="135"></point>
+        <point x="25" y="180"></point>
+        <point x="40" y="195"></point>
+        <point x="85" y="194"></point>
+        <point x="139" y="163"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="162" y="150"></point>
+        <point x="200" y="105"></point>
+        <point x="245" y="90"></point>
+        <point x="275" y="90"></point>
+        <point x="290" y="105"></point>
+        <point x="290" y="135"></point>
+        <point x="275" y="180"></point>
+        <point x="260" y="195"></point>
+        <point x="215" y="195"></point>
+        <point x="162" y="165"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="135" y="225"></point>
+        <point x="120" y="150"></point>
+        <point x="135" y="120"></point>
+        <point x="150" y="105"></point>
+        <point x="165" y="120"></point>
+        <point x="180" y="150"></point>
+        <point x="165" y="225"></point>
+      </polygon>
+      <circle x="135" y="90" marked="false" color="255" diameter="30" filled="true"></circle>
+      <line endX="195" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+      <line endX="105" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+    </shape>
+    <shape name="car" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="300" y="180"></point>
+        <point x="279" y="164"></point>
+        <point x="261" y="144"></point>
+        <point x="240" y="135"></point>
+        <point x="226" y="132"></point>
+        <point x="213" y="106"></point>
+        <point x="203" y="84"></point>
+        <point x="185" y="63"></point>
+        <point x="159" y="50"></point>
+        <point x="135" y="50"></point>
+        <point x="75" y="60"></point>
+        <point x="0" y="150"></point>
+        <point x="0" y="165"></point>
+        <point x="0" y="225"></point>
+        <point x="300" y="225"></point>
+        <point x="300" y="180"></point>
+      </polygon>
+      <circle x="180" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <circle x="30" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="162" y="80"></point>
+        <point x="132" y="78"></point>
+        <point x="134" y="135"></point>
+        <point x="209" y="135"></point>
+        <point x="194" y="105"></point>
+        <point x="189" y="96"></point>
+        <point x="180" y="89"></point>
+      </polygon>
+      <circle x="47" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+      <circle x="195" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="circle 2" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+    </shape>
+    <shape name="cow" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="200" y="193"></point>
+        <point x="197" y="249"></point>
+        <point x="179" y="249"></point>
+        <point x="177" y="196"></point>
+        <point x="166" y="187"></point>
+        <point x="140" y="189"></point>
+        <point x="93" y="191"></point>
+        <point x="78" y="179"></point>
+        <point x="72" y="211"></point>
+        <point x="49" y="209"></point>
+        <point x="48" y="181"></point>
+        <point x="37" y="149"></point>
+        <point x="25" y="120"></point>
+        <point x="25" y="89"></point>
+        <point x="45" y="72"></point>
+        <point x="103" y="84"></point>
+        <point x="179" y="75"></point>
+        <point x="198" y="76"></point>
+        <point x="252" y="64"></point>
+        <point x="272" y="81"></point>
+        <point x="293" y="103"></point>
+        <point x="285" y="121"></point>
+        <point x="255" y="121"></point>
+        <point x="242" y="118"></point>
+        <point x="224" y="167"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="73" y="210"></point>
+        <point x="86" y="251"></point>
+        <point x="62" y="249"></point>
+        <point x="48" y="208"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="25" y="114"></point>
+        <point x="16" y="195"></point>
+        <point x="9" y="204"></point>
+        <point x="23" y="213"></point>
+        <point x="25" y="200"></point>
+        <point x="39" y="123"></point>
+      </polygon>
+    </shape>
+    <shape name="cylinder" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="dot" rotatable="false" editableColorIndex="0">
+      <circle x="90" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+    </shape>
+    <shape name="face happy" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="90" y="239"></point>
+        <point x="62" y="213"></point>
+        <point x="47" y="191"></point>
+        <point x="67" y="179"></point>
+        <point x="90" y="203"></point>
+        <point x="109" y="218"></point>
+        <point x="150" y="225"></point>
+        <point x="192" y="218"></point>
+        <point x="210" y="203"></point>
+        <point x="227" y="181"></point>
+        <point x="251" y="194"></point>
+        <point x="236" y="217"></point>
+        <point x="212" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="face neutral" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="7" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <rectangle endX="240" startY="195" marked="false" color="255" endY="225" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="face sad" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="168"></point>
+        <point x="90" y="184"></point>
+        <point x="62" y="210"></point>
+        <point x="47" y="232"></point>
+        <point x="67" y="244"></point>
+        <point x="90" y="220"></point>
+        <point x="109" y="205"></point>
+        <point x="150" y="198"></point>
+        <point x="192" y="205"></point>
+        <point x="210" y="220"></point>
+        <point x="227" y="242"></point>
+        <point x="251" y="229"></point>
+        <point x="236" y="206"></point>
+        <point x="212" y="183"></point>
+      </polygon>
+    </shape>
+    <shape name="fish" rotatable="false" editableColorIndex="0">
+      <polygon color="-1" filled="true" marked="false">
+        <point x="44" y="131"></point>
+        <point x="21" y="87"></point>
+        <point x="15" y="86"></point>
+        <point x="0" y="120"></point>
+        <point x="15" y="150"></point>
+        <point x="0" y="180"></point>
+        <point x="13" y="214"></point>
+        <point x="20" y="212"></point>
+        <point x="45" y="166"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="135" y="195"></point>
+        <point x="119" y="235"></point>
+        <point x="95" y="218"></point>
+        <point x="76" y="210"></point>
+        <point x="46" y="204"></point>
+        <point x="60" y="165"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="75" y="45"></point>
+        <point x="83" y="77"></point>
+        <point x="71" y="103"></point>
+        <point x="86" y="114"></point>
+        <point x="166" y="78"></point>
+        <point x="135" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="136"></point>
+        <point x="151" y="77"></point>
+        <point x="226" y="81"></point>
+        <point x="280" y="119"></point>
+        <point x="292" y="146"></point>
+        <point x="292" y="160"></point>
+        <point x="287" y="170"></point>
+        <point x="270" y="195"></point>
+        <point x="195" y="210"></point>
+        <point x="151" y="212"></point>
+        <point x="30" y="166"></point>
+      </polygon>
+      <circle x="215" y="106" marked="false" color="255" diameter="30" filled="true"></circle>
+    </shape>
+    <shape name="flag" rotatable="false" editableColorIndex="0">
+      <rectangle endX="75" startY="15" marked="true" color="-1920102913" endY="300" startX="60" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="90" y="150"></point>
+        <point x="270" y="90"></point>
+        <point x="90" y="30"></point>
+      </polygon>
+      <line endX="90" startY="135" marked="true" color="-1920102913" endY="135" startX="75"></line>
+      <line endX="90" startY="45" marked="true" color="-1920102913" endY="45" startX="75"></line>
+    </shape>
+    <shape name="flower" rotatable="false" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="135" y="120"></point>
+        <point x="165" y="165"></point>
+        <point x="180" y="210"></point>
+        <point x="180" y="240"></point>
+        <point x="150" y="300"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="240"></point>
+        <point x="195" y="195"></point>
+        <point x="165" y="135"></point>
+      </polygon>
+      <circle x="85" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="147" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="192" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="85" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="70" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="25" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="96" y="51" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="113" y="68" marked="false" color="255" diameter="74" filled="true"></circle>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="189" y="233"></point>
+        <point x="219" y="188"></point>
+        <point x="249" y="173"></point>
+        <point x="279" y="188"></point>
+        <point x="234" y="218"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="180" y="255"></point>
+        <point x="150" y="210"></point>
+        <point x="105" y="210"></point>
+        <point x="75" y="240"></point>
+        <point x="135" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="house" rotatable="false" editableColorIndex="0">
+      <rectangle endX="255" startY="120" marked="true" color="-1920102913" endY="285" startX="45" filled="true"></rectangle>
+      <rectangle endX="180" startY="210" marked="false" color="255" endY="285" startX="120" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="120"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+      <line endX="270" startY="120" marked="false" color="255" endY="120" startX="30"></line>
+    </shape>
+    <shape name="leaf" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="210"></point>
+        <point x="135" y="195"></point>
+        <point x="120" y="210"></point>
+        <point x="60" y="210"></point>
+        <point x="30" y="195"></point>
+        <point x="60" y="180"></point>
+        <point x="60" y="165"></point>
+        <point x="15" y="135"></point>
+        <point x="30" y="120"></point>
+        <point x="15" y="105"></point>
+        <point x="40" y="104"></point>
+        <point x="45" y="90"></point>
+        <point x="60" y="90"></point>
+        <point x="90" y="105"></point>
+        <point x="105" y="120"></point>
+        <point x="120" y="120"></point>
+        <point x="105" y="60"></point>
+        <point x="120" y="60"></point>
+        <point x="135" y="30"></point>
+        <point x="150" y="15"></point>
+        <point x="165" y="30"></point>
+        <point x="180" y="60"></point>
+        <point x="195" y="60"></point>
+        <point x="180" y="120"></point>
+        <point x="195" y="120"></point>
+        <point x="210" y="105"></point>
+        <point x="240" y="90"></point>
+        <point x="255" y="90"></point>
+        <point x="263" y="104"></point>
+        <point x="285" y="105"></point>
+        <point x="270" y="120"></point>
+        <point x="285" y="135"></point>
+        <point x="240" y="165"></point>
+        <point x="240" y="180"></point>
+        <point x="270" y="195"></point>
+        <point x="240" y="210"></point>
+        <point x="180" y="210"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="195"></point>
+        <point x="135" y="240"></point>
+        <point x="120" y="255"></point>
+        <point x="105" y="255"></point>
+        <point x="105" y="285"></point>
+        <point x="135" y="285"></point>
+        <point x="165" y="240"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+    </shape>
+    <shape name="line" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="300" startX="150"></line>
+    </shape>
+    <shape name="line half" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="150" startX="150"></line>
+    </shape>
+    <shape name="pentagon" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="15"></point>
+        <point x="15" y="120"></point>
+        <point x="60" y="285"></point>
+        <point x="240" y="285"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+    </shape>
+    <shape name="person" rotatable="false" editableColorIndex="0">
+      <circle x="110" y="5" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="120" y="195"></point>
+        <point x="90" y="285"></point>
+        <point x="105" y="300"></point>
+        <point x="135" y="300"></point>
+        <point x="150" y="225"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="300"></point>
+        <point x="210" y="285"></point>
+        <point x="180" y="195"></point>
+        <point x="195" y="90"></point>
+      </polygon>
+      <rectangle endX="172" startY="79" marked="true" color="-1920102913" endY="94" startX="127" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="195" y="90"></point>
+        <point x="240" y="150"></point>
+        <point x="225" y="180"></point>
+        <point x="165" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="60" y="150"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="105"></point>
+      </polygon>
+    </shape>
+    <shape name="plant" rotatable="false" editableColorIndex="0">
+      <rectangle endX="165" startY="90" marked="true" color="-1920102913" endY="300" startX="135" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="255"></point>
+        <point x="90" y="210"></point>
+        <point x="45" y="195"></point>
+        <point x="75" y="255"></point>
+        <point x="135" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="255"></point>
+        <point x="210" y="210"></point>
+        <point x="255" y="195"></point>
+        <point x="225" y="255"></point>
+        <point x="165" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="180"></point>
+        <point x="90" y="135"></point>
+        <point x="45" y="120"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="180"></point>
+        <point x="165" y="210"></point>
+        <point x="225" y="180"></point>
+        <point x="255" y="120"></point>
+        <point x="210" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="105"></point>
+        <point x="90" y="60"></point>
+        <point x="45" y="45"></point>
+        <point x="75" y="105"></point>
+        <point x="135" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="105"></point>
+        <point x="165" y="135"></point>
+        <point x="225" y="105"></point>
+        <point x="255" y="45"></point>
+        <point x="210" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="90"></point>
+        <point x="120" y="45"></point>
+        <point x="150" y="15"></point>
+        <point x="180" y="45"></point>
+        <point x="165" y="90"></point>
+      </polygon>
+    </shape>
+    <shape name="sheep" rotatable="false" editableColorIndex="15">
+      <circle x="203" y="65" marked="true" color="-1" diameter="88" filled="true"></circle>
+      <circle x="70" y="65" marked="true" color="-1" diameter="162" filled="true"></circle>
+      <circle x="150" y="105" marked="true" color="-1" diameter="120" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="218" y="120"></point>
+        <point x="240" y="165"></point>
+        <point x="255" y="165"></point>
+        <point x="278" y="120"></point>
+      </polygon>
+      <circle x="214" y="72" marked="false" color="-1920102913" diameter="67" filled="true"></circle>
+      <rectangle endX="179" startY="223" marked="true" color="-1" endY="298" startX="164" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="45" y="285"></point>
+        <point x="30" y="285"></point>
+        <point x="30" y="240"></point>
+        <point x="15" y="195"></point>
+        <point x="45" y="210"></point>
+      </polygon>
+      <circle x="3" y="83" marked="true" color="-1" diameter="150" filled="true"></circle>
+      <rectangle endX="80" startY="221" marked="true" color="-1" endY="296" startX="65" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="195" y="285"></point>
+        <point x="210" y="285"></point>
+        <point x="210" y="240"></point>
+        <point x="240" y="210"></point>
+        <point x="195" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="276" y="85"></point>
+        <point x="285" y="105"></point>
+        <point x="302" y="99"></point>
+        <point x="294" y="83"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="219" y="85"></point>
+        <point x="210" y="105"></point>
+        <point x="193" y="99"></point>
+        <point x="201" y="83"></point>
+      </polygon>
+    </shape>
+    <shape name="square" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+    </shape>
+    <shape name="square 2" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+      <rectangle endX="240" startY="60" marked="false" color="255" endY="240" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="star" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="151" y="1"></point>
+        <point x="185" y="108"></point>
+        <point x="298" y="108"></point>
+        <point x="207" y="175"></point>
+        <point x="242" y="282"></point>
+        <point x="151" y="216"></point>
+        <point x="59" y="282"></point>
+        <point x="94" y="175"></point>
+        <point x="3" y="108"></point>
+        <point x="116" y="108"></point>
+      </polygon>
+    </shape>
+    <shape name="target" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <circle x="60" y="60" marked="true" color="-1920102913" diameter="180" filled="true"></circle>
+      <circle x="90" y="90" marked="false" color="255" diameter="120" filled="true"></circle>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+    </shape>
+    <shape name="tree" rotatable="false" editableColorIndex="0">
+      <circle x="118" y="3" marked="true" color="-1920102913" diameter="94" filled="true"></circle>
+      <rectangle endX="180" startY="195" marked="false" color="-1653716737" endY="300" startX="120" filled="true"></rectangle>
+      <circle x="65" y="21" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="116" y="41" marked="true" color="-1920102913" diameter="127" filled="true"></circle>
+      <circle x="45" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+      <circle x="104" y="74" marked="true" color="-1920102913" diameter="152" filled="true"></circle>
+    </shape>
+    <shape name="triangle" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+    </shape>
+    <shape name="triangle 2" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="151" y="99"></point>
+        <point x="225" y="223"></point>
+        <point x="75" y="224"></point>
+      </polygon>
+    </shape>
+    <shape name="truck" rotatable="false" editableColorIndex="0">
+      <rectangle endX="195" startY="45" marked="true" color="-1920102913" endY="187" startX="4" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="296" y="193"></point>
+        <point x="296" y="150"></point>
+        <point x="259" y="134"></point>
+        <point x="244" y="104"></point>
+        <point x="208" y="104"></point>
+        <point x="207" y="194"></point>
+      </polygon>
+      <rectangle endX="195" startY="60" marked="false" color="-1" endY="105" startX="195" filled="true"></rectangle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="238" y="112"></point>
+        <point x="252" y="141"></point>
+        <point x="219" y="141"></point>
+        <point x="218" y="112"></point>
+      </polygon>
+      <circle x="234" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <rectangle endX="214" startY="185" marked="true" color="-1920102913" endY="194" startX="181" filled="true"></rectangle>
+      <circle x="144" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="144" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="234" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+    </shape>
+    <shape name="turtle" rotatable="true" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="215" y="204"></point>
+        <point x="240" y="233"></point>
+        <point x="246" y="254"></point>
+        <point x="228" y="266"></point>
+        <point x="215" y="252"></point>
+        <point x="193" y="210"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="195" y="90"></point>
+        <point x="225" y="75"></point>
+        <point x="245" y="75"></point>
+        <point x="260" y="89"></point>
+        <point x="269" y="108"></point>
+        <point x="261" y="124"></point>
+        <point x="240" y="105"></point>
+        <point x="225" y="105"></point>
+        <point x="210" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="105" y="90"></point>
+        <point x="75" y="75"></point>
+        <point x="55" y="75"></point>
+        <point x="40" y="89"></point>
+        <point x="31" y="108"></point>
+        <point x="39" y="124"></point>
+        <point x="60" y="105"></point>
+        <point x="75" y="105"></point>
+        <point x="90" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="132" y="85"></point>
+        <point x="134" y="64"></point>
+        <point x="107" y="51"></point>
+        <point x="108" y="17"></point>
+        <point x="150" y="2"></point>
+        <point x="192" y="18"></point>
+        <point x="192" y="52"></point>
+        <point x="169" y="65"></point>
+        <point x="172" y="87"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="85" y="204"></point>
+        <point x="60" y="233"></point>
+        <point x="54" y="254"></point>
+        <point x="72" y="266"></point>
+        <point x="85" y="252"></point>
+        <point x="107" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="119" y="75"></point>
+        <point x="179" y="75"></point>
+        <point x="209" y="101"></point>
+        <point x="224" y="135"></point>
+        <point x="220" y="225"></point>
+        <point x="175" y="261"></point>
+        <point x="128" y="261"></point>
+        <point x="81" y="224"></point>
+        <point x="74" y="135"></point>
+        <point x="88" y="99"></point>
+      </polygon>
+    </shape>
+    <shape name="wheel" rotatable="false" editableColorIndex="0">
+      <circle x="3" y="3" marked="true" color="-1920102913" diameter="294" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <line endX="150" startY="285" marked="true" color="-1920102913" endY="15" startX="150"></line>
+      <line endX="285" startY="150" marked="true" color="-1920102913" endY="150" startX="15"></line>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+      <line endX="79" startY="40" marked="true" color="-1920102913" endY="269" startX="216"></line>
+      <line endX="269" startY="84" marked="true" color="-1920102913" endY="221" startX="40"></line>
+      <line endX="269" startY="216" marked="true" color="-1920102913" endY="79" startX="40"></line>
+      <line endX="221" startY="40" marked="true" color="-1920102913" endY="269" startX="84"></line>
+    </shape>
+    <shape name="wolf" rotatable="false" editableColorIndex="0">
+      <polygon color="255" filled="true" marked="false">
+        <point x="253" y="133"></point>
+        <point x="245" y="131"></point>
+        <point x="245" y="133"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="2" y="194"></point>
+        <point x="13" y="197"></point>
+        <point x="30" y="191"></point>
+        <point x="38" y="193"></point>
+        <point x="38" y="205"></point>
+        <point x="20" y="226"></point>
+        <point x="20" y="257"></point>
+        <point x="27" y="265"></point>
+        <point x="38" y="266"></point>
+        <point x="40" y="260"></point>
+        <point x="31" y="253"></point>
+        <point x="31" y="230"></point>
+        <point x="60" y="206"></point>
+        <point x="68" y="198"></point>
+        <point x="75" y="209"></point>
+        <point x="66" y="228"></point>
+        <point x="65" y="243"></point>
+        <point x="82" y="261"></point>
+        <point x="84" y="268"></point>
+        <point x="100" y="267"></point>
+        <point x="103" y="261"></point>
+        <point x="77" y="239"></point>
+        <point x="79" y="231"></point>
+        <point x="100" y="207"></point>
+        <point x="98" y="196"></point>
+        <point x="119" y="201"></point>
+        <point x="143" y="202"></point>
+        <point x="160" y="195"></point>
+        <point x="166" y="210"></point>
+        <point x="172" y="213"></point>
+        <point x="173" y="238"></point>
+        <point x="167" y="251"></point>
+        <point x="160" y="248"></point>
+        <point x="154" y="265"></point>
+        <point x="169" y="264"></point>
+        <point x="178" y="247"></point>
+        <point x="186" y="240"></point>
+        <point x="198" y="260"></point>
+        <point x="200" y="271"></point>
+        <point x="217" y="271"></point>
+        <point x="219" y="262"></point>
+        <point x="207" y="258"></point>
+        <point x="195" y="230"></point>
+        <point x="192" y="198"></point>
+        <point x="210" y="184"></point>
+        <point x="227" y="164"></point>
+        <point x="242" y="144"></point>
+        <point x="259" y="145"></point>
+        <point x="284" y="151"></point>
+        <point x="277" y="141"></point>
+        <point x="293" y="140"></point>
+        <point x="299" y="134"></point>
+        <point x="297" y="127"></point>
+        <point x="273" y="119"></point>
+        <point x="270" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="-1" y="195"></point>
+        <point x="14" y="180"></point>
+        <point x="36" y="166"></point>
+        <point x="40" y="153"></point>
+        <point x="53" y="140"></point>
+        <point x="82" y="131"></point>
+        <point x="134" y="133"></point>
+        <point x="159" y="126"></point>
+        <point x="188" y="115"></point>
+        <point x="227" y="108"></point>
+        <point x="236" y="102"></point>
+        <point x="238" y="98"></point>
+        <point x="268" y="86"></point>
+        <point x="269" y="92"></point>
+        <point x="281" y="87"></point>
+        <point x="269" y="103"></point>
+        <point x="269" y="113"></point>
+      </polygon>
+    </shape>
+    <shape name="x" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="270" y="75"></point>
+        <point x="225" y="30"></point>
+        <point x="30" y="225"></point>
+        <point x="75" y="270"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="75"></point>
+        <point x="75" y="30"></point>
+        <point x="270" y="225"></point>
+        <point x="225" y="270"></point>
+      </polygon>
+    </shape>
+  </turtleShapes>
+  <linkShapes>
+    <shape name="default" curviness="0.0">
+      <lines>
+        <line x="-0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+        <line x="0.0" visible="true">
+          <dash value="1.0"></dash>
+          <dash value="0.0"></dash>
+        </line>
+        <line x="0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+      </lines>
+      <indicator>
+        <shape name="link direction" rotatable="true" editableColorIndex="0">
+          <line endX="90" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+          <line endX="210" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+        </shape>
+      </indicator>
+    </shape>
+  </linkShapes>
+  <previewCommands>setup repeat 75 [ go ]</previewCommands>
+</model>

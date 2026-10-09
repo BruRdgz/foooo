@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SimGeoPE · World inspector</title>
+  <link href="https://unpkg.com/maplibre-gl@5.6.2/dist/maplibre-gl.css" rel="stylesheet">
+  <link href="/static/styles.css" rel="stylesheet">
+  <script defer src="https://unpkg.com/maplibre-gl@5.6.2/dist/maplibre-gl.js"></script>
+  <script defer src="/static/app.js"></script>
+</head>
+<body>
+  <main id="map" aria-label="Pernambuco world map"></main>
+  <aside>
+    <header><h1>SimGeoPE</h1><span>Static world inspector</span></header>
+    <fieldset id="toggles"><legend>Layers</legend>
+      <label><input type="checkbox" data-layer="admin" checked>Municipal boundaries</label>
+      <label><input type="checkbox" data-layer="roads" checked>Roads</label>
+      <label><input type="checkbox" data-layer="hydro" checked>Hydrology</label>
+      <label><input type="checkbox" data-layer="crossings" checked>Road / water crossings</label>
+      <label><input type="checkbox" data-layer="facilities" checked>Facilities</label>
+      <label><input type="checkbox" data-layer="environment">Environment: water distance</label>
+    </fieldset>
+    <fieldset><legend>Route debug</legend>
+      <p>Choose A/B, then click two points or facilities.</p>
+      <div class="buttons"><button id="choose-route">Choose A / B</button><button id="clear-route">Clear</button></div>
+      <output id="endpoints">No route selected.</output>
+      <label for="closed">Closed edge IDs (comma separated)</label><input id="closed" placeholder="123, 456">
+      <label for="costs">Cost multipliers (JSON edge ID → factor)</label><textarea id="costs" rows="2" placeholder='{"123": 2}'></textarea>
+      <button id="requery">Recalculate route</button>
+      <output id="route-metrics"></output>
+    </fieldset>
+    <p id="status" role="status">Loading world…</p>
+    <details open><summary>Inspection</summary><pre id="inspection">Click a feature or any point.</pre></details>
+    <details><summary>World metadata / limitations</summary><pre id="metadata"></pre></details>
+    <footer>Layers query the loaded world. Debug costs are temporary.<br>MapLibre CDN and OSM basemap require internet.</footer>
+  </aside>
+</body>
+</html>

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "simgeope"
+version = "0.1.0"
+description = "Reusable Pernambuco administrative and road world model"
+requires-python = ">=3.12"
+dependencies = [
+  "numpy>=1.26", "scipy>=1.11", "shapely>=2.0", "pyproj>=3.6", "pyarrow>=14",
+]
+
+[project.optional-dependencies]
+build = ["osmium>=4.0"]
+dev = ["pytest>=8"]
+spreadsheet = ["openpyxl>=3.1"]
+viewer = ["fastapi>=0.115", "uvicorn>=0.30", "httpx>=0.27"]
+simulation = ["mesa>=3.3,<4", "networkx>=3.3"]
+
+[project.scripts]
+simgeope = "simgeope.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+simgeope = ["web/*.html", "web/*.js", "web/*.css"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = ["data: requires locally pinned IBGE/OSM sources or a built real world"]

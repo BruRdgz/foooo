@@ -14,6 +14,12 @@ def main(argv=None) -> int:
     serve = commands.add_parser("serve", help="Serve the local world inspector")
     serve.add_argument("--world", required=True, help="Built world directory")
     serve.add_argument("--port", type=int, default=8000)
+    serve.add_argument(
+        "--simulate",
+        action="store_true",
+        help="Also serve a live H5N1 simulation (requires the simulation extra)",
+    )
+    serve.add_argument("--seed", type=int, default=42, help="Initial simulation seed")
     world = commands.add_parser("world", help="Build the static Pernambuco world")
     operations = world.add_subparsers(dest="operation", required=True)
     build = operations.add_parser(
@@ -55,8 +61,14 @@ def main(argv=None) -> int:
                 import uvicorn
             except ImportError as exc:
                 raise ImportError("uvicorn (install simgeope[viewer])") from exc
+            loaded = PernambucoWorld.load(args.world)
+            simulation = None
+            if args.simulate:
+                from .api.simulation import SimulationSession
+
+                simulation = SimulationSession(loaded, seed=args.seed)
             uvicorn.run(
-                create_app(PernambucoWorld.load(args.world)),
+                create_app(loaded, simulation=simulation),
                 host="127.0.0.1",
                 port=args.port,
             )

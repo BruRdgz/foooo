@@ -235,6 +235,12 @@ class RoadNetwork:
     def travel_time(self, origin, destination, *, state=None):
         return self.router.travel_time(origin, destination, state=state)
 
+    def travel_times(self, origin, destinations, *, state=None):
+        return self.router.travel_times(origin, destinations, state=state)
+
+    def largest_component_nodes(self):
+        return self.router.largest_component_nodes()
+
     def distance(self, origin, destination, *, state=None):
         return self.router.distance(origin, destination, state=state)
 

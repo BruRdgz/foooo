@@ -1,2 +1,118 @@
 dia,tipo_evento,detalhes
-0,INTRODUCAO_INICIAL,Granja f0008: exposição via INTRODUCAO_INICIAL (+50)
+0,AVISO_FROTA,18 granjas fora do alcance de um turno da frota feed_mill
+0,AVISO_FROTA,15 granjas fora do alcance de um turno da frota slaughterhouse
+0,INTRODUCAO_INICIAL,Granja f0097: exposição via INTRODUCAO_INICIAL (+50)
+2,INFECCAO,Granja f0097: +15.8 aves expostas
+3,INFECCAO,Granja f0097: +22.4 aves expostas
+4,INFECCAO,Granja f0097: +28.7 aves expostas
+5,INFECCAO,Granja f0097: +36.3 aves expostas
+6,INFECCAO,Granja f0097: +45.8 aves expostas
+7,INFECCAO,Granja f0097: +57.6 aves expostas
+7,DETECCAO,Granja f0097 notificada às autoridades
+8,INFECCAO,Granja f0097: +72.1 aves expostas
+8,REACAO_AUTOMATICA,Granja f0097: bloqueio automático aplicado
+9,INFECCAO,Granja f0097: +89.7 aves expostas
+10,INFECCAO,Granja f0097: +111.0 aves expostas
+11,INFECCAO,Granja f0097: +136.2 aves expostas
+12,INFECCAO,Granja f0097: +165.3 aves expostas
+13,INFECCAO,Granja f0097: +198.1 aves expostas
+14,INFECCAO,Granja f0097: +233.6 aves expostas
+15,INFECCAO,Granja f0097: +270.1 aves expostas
+16,INFECCAO,Granja f0097: +304.8 aves expostas
+17,INFECCAO,Granja f0097: +334.3 aves expostas
+18,INFECCAO,Granja f0097: +354.4 aves expostas
+19,INFECCAO,Granja f0097: +361.3 aves expostas
+20,INFECCAO,Granja f0097: +352.6 aves expostas
+21,INFECCAO,Granja f0097: +328.4 aves expostas
+22,INFECCAO,Granja f0097: +291.2 aves expostas
+23,INFECCAO,Granja f0097: +246.2 aves expostas
+24,INFECCAO,Granja f0097: +199.2 aves expostas
+25,INFECCAO,Granja f0097: +155.3 aves expostas
+26,INFECCAO,Granja f0097: +117.6 aves expostas
+27,INFECCAO,Granja f0097: +87.3 aves expostas
+28,INFECCAO,Granja f0097: +64.2 aves expostas
+29,INFECCAO,Granja f0097: +47.0 aves expostas
+30,INFECCAO,Granja f0097: +34.5 aves expostas
+31,INFECCAO,Granja f0097: +25.5 aves expostas
+32,INFECCAO,Granja f0097: +19.0 aves expostas
+33,INFECCAO,Granja f0097: +14.3 aves expostas
+34,INFECCAO,Granja f0097: +10.8 aves expostas
+35,INFECCAO,Granja f0097: +8.2 aves expostas
+36,INFECCAO,Granja f0097: +6.3 aves expostas
+37,INFECCAO,Granja f0097: +4.9 aves expostas
+38,INFECCAO,Granja f0097: +3.8 aves expostas
+39,INFECCAO,Granja f0097: +3.0 aves expostas
+40,INFECCAO,Granja f0097: +2.3 aves expostas
+41,INFECCAO,Granja f0097: +1.8 aves expostas
+42,INFECCAO,Granja f0097: +1.4 aves expostas
+43,INFECCAO,Granja f0097: +1.1 aves expostas
+44,INFECCAO,Granja f0097: +0.9 aves expostas
+45,INFECCAO,Granja f0097: +0.7 aves expostas
+46,INFECCAO,Granja f0097: +0.6 aves expostas
+61,FIM_INFECCAO,Granja f0097: sem aves infectadas
+62,CHEGADA_BANDO_INFECTADO,Bando migratório de 7 aves chegou com ave infectada
+62,INFECCAO_AVES_SILVESTRES,1 aves silvestres infectadas
+66,INFECCAO_AVES_SILVESTRES,1 aves silvestres infectadas
+67,INFECCAO_AVES_SILVESTRES,2 aves silvestres infectadas
+70,INFECCAO_AVES_SILVESTRES,1 aves silvestres infectadas
+71,CHEGADA_BANDO_INFECTADO,Bando migratório de 4 aves chegou com ave infectada
+72,INFECCAO_AVES_SILVESTRES,1 aves silvestres infectadas
+75,INFECCAO_AVES_SILVESTRES,1 aves silvestres infectadas
+82,CHEGADA_BANDO_INFECTADO,Bando migratório de 5 aves chegou com ave infectada
+82,INFECCAO_AVES_SILVESTRES,1 aves silvestres infectadas
+82,LIBERACAO_QUARENTENA,Granja f0097: quarentena encerrada
+83,INFECCAO_AVES_SILVESTRES,8 aves silvestres infectadas
+84,INFECCAO_AVES_SILVESTRES,9 aves silvestres infectadas
+85,INFECCAO_AVES_SILVESTRES,6 aves silvestres infectadas
+86,INFECCAO_AVES_SILVESTRES,1 aves silvestres infectadas
+117,CHEGADA_BANDO_INFECTADO,Bando migratório de 8 aves chegou com ave infectada
+117,INFECCAO_AVES_SILVESTRES,1 aves silvestres infectadas
+118,INFECCAO_AVES_SILVESTRES,1 aves silvestres infectadas
+120,INFECCAO_AVES_SILVESTRES,2 aves silvestres infectadas
+121,INFECCAO_AVES_SILVESTRES,2 aves silvestres infectadas
+122,INFECCAO_AVES_SILVESTRES,1 aves silvestres infectadas
+149,CHEGADA_BANDO_INFECTADO,Bando migratório de 13 aves chegou com ave infectada
+149,INFECCAO_AVES_SILVESTRES,2 aves silvestres infectadas
+150,INFECCAO_AVES_SILVESTRES,4 aves silvestres infectadas
+150,INTRODUCAO_AVES_MIGRATORIAS,Granja f0069: exposição via INTRODUCAO_AVES_MIGRATORIAS (+10)
+151,INFECCAO_AVES_SILVESTRES,3 aves silvestres infectadas
+151,DETECCAO,Granja f0069 notificada às autoridades
+151,REACAO_AUTOMATICA,Granja f0069: bloqueio automático aplicado
+152,INFECCAO,Granja f0069: +3.2 aves expostas
+152,INFECCAO_AVES_SILVESTRES,1 aves silvestres infectadas
+153,INFECCAO,Granja f0069: +4.5 aves expostas
+153,INFECCAO_AVES_SILVESTRES,1 aves silvestres infectadas
+154,INFECCAO,Granja f0069: +5.8 aves expostas
+155,INFECCAO,Granja f0069: +7.4 aves expostas
+156,INFECCAO,Granja f0069: +9.5 aves expostas
+157,INFECCAO,Granja f0069: +12.0 aves expostas
+158,INFECCAO,Granja f0069: +15.3 aves expostas
+159,INFECCAO,Granja f0069: +19.4 aves expostas
+160,INFECCAO,Granja f0069: +24.6 aves expostas
+161,INFECCAO,Granja f0069: +31.1 aves expostas
+162,INFECCAO,Granja f0069: +39.3 aves expostas
+163,INFECCAO,Granja f0069: +49.4 aves expostas
+164,INFECCAO,Granja f0069: +62.0 aves expostas
+165,INFECCAO,Granja f0069: +77.5 aves expostas
+166,INFECCAO,Granja f0069: +96.2 aves expostas
+167,INFECCAO,Granja f0069: +118.7 aves expostas
+168,INFECCAO,Granja f0069: +145.0 aves expostas
+169,INFECCAO,Granja f0069: +175.2 aves expostas
+170,INFECCAO,Granja f0069: +208.8 aves expostas
+171,INFECCAO,Granja f0069: +244.5 aves expostas
+172,INFECCAO,Granja f0069: +280.4 aves expostas
+172,CHEGADA_BANDO_INFECTADO,Bando migratório de 9 aves chegou com ave infectada
+173,INFECCAO,Granja f0069: +313.5 aves expostas
+173,INFECCAO_AVES_SILVESTRES,1 aves silvestres infectadas
+174,INFECCAO,Granja f0069: +340.1 aves expostas
+174,INFECCAO_AVES_SILVESTRES,4 aves silvestres infectadas
+175,INFECCAO,Granja f0069: +356.0 aves expostas
+175,INFECCAO_AVES_SILVESTRES,1 aves silvestres infectadas
+176,INFECCAO,Granja f0069: +358.0 aves expostas
+176,INFECCAO_AVES_SILVESTRES,3 aves silvestres infectadas
+177,INFECCAO,Granja f0069: +344.2 aves expostas
+177,INFECCAO_AVES_SILVESTRES,1 aves silvestres infectadas
+178,INFECCAO,Granja f0069: +315.7 aves expostas
+179,INFECCAO,Granja f0069: +275.8 aves expostas
+179,CHEGADA_BANDO_INFECTADO,Bando migratório de 6 aves chegou com ave infectada
+180,INFECCAO,Granja f0069: +230.0 aves expostas

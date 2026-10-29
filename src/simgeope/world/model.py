@@ -234,6 +234,13 @@ class PernambucoWorld:
     def travel_time(self, origin, destination, *, state=None):
         return self.route(origin, destination, state=state).travel_time_s
 
+    def travel_times(self, origin, destinations, *, state=None):
+        return self._roads().travel_times(
+            self._node(origin),
+            [self._node(destination) for destination in destinations],
+            state=state,
+        )
+
     def distance(self, origin, destination, *, state=None):
         return self.route(origin, destination, state=state).distance_m
 

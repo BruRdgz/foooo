@@ -88,8 +88,22 @@ def _collection(records, viewport=None, limit=MAX_FEATURES):
     }
 
 
-def create_app(world: PernambucoWorld):
-    """Create the optional viewer without loading worlds or build-time tools."""
+def _route_coordinates(world, edge_ids):
+    """Concatenate road edge geometries; None when over the coordinate budget."""
+    coordinates = []
+    for edge in edge_ids:
+        segment = list(world.roads.geometry(edge).coords)
+        coordinates.extend(segment if not coordinates else segment[1:])
+        if len(coordinates) > MAX_COORDINATES:
+            return None
+    return coordinates
+
+
+def create_app(world: PernambucoWorld, *, simulation=None):
+    """Create the optional viewer without loading worlds or build-time tools.
+
+    ``simulation`` is an optional live ``SimulationSession`` on the same world.
+    """
     try:
         from fastapi import FastAPI, HTTPException, Query, Request
         from fastapi.responses import FileResponse
@@ -165,6 +179,7 @@ def create_app(world: PernambucoWorld):
                 name: getattr(world, name) is not None
                 for name in ("roads", "hydro", "facilities", "environment")
             },
+            "simulation": simulation is not None,
             "limits": {
                 "features": MAX_FEATURES,
                 "environment_cells": MAX_CELLS,
@@ -402,14 +417,11 @@ def create_app(world: PernambucoWorld):
             ) from None
         if len(result.edge_ids) > 20_000:
             raise HTTPException(413, "Route exceeds the viewer response budget")
-        coordinates = []
-        for edge in result.edge_ids:
-            segment = list(world.roads.geometry(edge).coords)
-            coordinates.extend(segment if not coordinates else segment[1:])
-            if len(coordinates) > MAX_COORDINATES:
-                raise HTTPException(
-                    413, "Route geometry exceeds the viewer response budget"
-                )
+        coordinates = _route_coordinates(world, result.edge_ids)
+        if coordinates is None:
+            raise HTTPException(
+                413, "Route geometry exceeds the viewer response budget"
+            )
         if coordinates:
             geometry = {"type": "LineString", "coordinates": coordinates}
         else:
@@ -421,4 +433,8 @@ def create_app(world: PernambucoWorld):
             "properties": _properties(result),
         }
 
+    if simulation is not None:
+        from .simulation import add_simulation_routes
+
+        add_simulation_routes(app, simulation)
     return app

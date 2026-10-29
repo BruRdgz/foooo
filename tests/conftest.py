@@ -1,8 +1,7 @@
 import pytest
 
 
-@pytest.fixture
-def tiny_world(tmp_path):
+def _tiny_world(tmp_path, extra_edges=()):
     from shapely.geometry import LineString, box
     from shapely.ops import unary_union
 
@@ -42,6 +41,7 @@ def tiny_world(tmp_path):
         (2, 20, 30, 10),
         (3, 10, 40, 30),
         (4, 40, 30, 30),
+        *extra_edges,
     ]:
         geometry = LineString([positions[u], positions[v]])
         edges.append(
@@ -80,9 +80,20 @@ def tiny_world(tmp_path):
             "municipalities": 2,
             "state_boundaries": 1,
             "road_nodes": 5,
-            "road_edges": 4,
+            "road_edges": 4 + len(extra_edges),
             "facilities": 2,
         },
     )
     manifest.save(tmp_path / "manifest.json")
     return PernambucoWorld.load(tmp_path)
+
+
+@pytest.fixture
+def tiny_world(tmp_path):
+    return _tiny_world(tmp_path)
+
+
+@pytest.fixture
+def two_way_world(tmp_path):
+    """Tiny world whose 10-20-30 corridor is also drivable back towards 10."""
+    return _tiny_world(tmp_path, extra_edges=[(5, 20, 10, 10), (6, 30, 20, 10)])

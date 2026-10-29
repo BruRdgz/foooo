@@ -5,7 +5,7 @@ from math import isfinite
 
 import numpy as np
 from scipy.sparse import csr_matrix
-from scipy.sparse.csgraph import dijkstra
+from scipy.sparse.csgraph import connected_components, dijkstra
 
 from ..exceptions import RouteNotFoundError
 from .state import RoadRuntimeState
@@ -94,8 +94,35 @@ class Router:
             float(sum(edge.length_m for edge in selected)),
         )
 
+    def travel_times(self, origin, destinations, *, state=None):
+        """Fastest times from one origin to many nodes in one Dijkstra pass.
+
+        Unlike ``route()``, an unreachable destination yields ``inf`` instead of
+        raising, so callers can filter many candidates at once.
+        """
+        destinations = tuple(destinations)
+        for node in (origin, *destinations):
+            if node not in self.node_index:
+                raise RouteNotFoundError(f"Unknown road node: {node}")
+        graph = self._base_graph if state is None else self._graph(state)[0]
+        costs = dijkstra(graph, directed=True, indices=self.node_index[origin])
+        return costs[[self.node_index[node] for node in destinations]]
+
     def travel_time(self, origin, destination, *, state=None):
         return self.route(origin, destination, state=state).travel_time_s
+
+    def largest_component_nodes(self):
+        """Nodes of the largest strongly connected component (mutually reachable).
+
+        Ties between equally large components go to the lowest component label.
+        """
+        if not self.node_ids:
+            return frozenset()
+        _, labels = connected_components(
+            self._base_graph, directed=True, connection="strong"
+        )
+        largest = int(np.bincount(labels).argmax())
+        return frozenset(self.node_ids[i] for i in np.flatnonzero(labels == largest))
 
     def distance(self, origin, destination, *, state=None):
         return self.route(origin, destination, state=state).distance_m

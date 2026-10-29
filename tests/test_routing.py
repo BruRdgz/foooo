@@ -90,3 +90,28 @@ def test_equal_cost_parallel_edges_are_deterministic():
 def test_effective_cost_overflow_is_explicit(router):
     with pytest.raises(ValueError, match="effective travel cost"):
         router.route(1, 3, state=RoadRuntimeState(cost_multiplier={0: 1e308}))
+
+
+def test_one_to_many_travel_times_match_routes_and_mark_unreachable(router):
+    times = router.travel_times(1, (3, 2, 1, 8))
+    assert list(times) == [20, 10, 0, float("inf")]
+    closed = RoadRuntimeState(closed_edges={0, 1})
+    assert router.travel_times(1, (3,), state=closed)[0] == router.travel_time(
+        1, 3, state=closed
+    )
+    with pytest.raises(RouteNotFoundError):
+        router.travel_times(1, (99,))
+
+
+def test_largest_component_contains_only_mutually_reachable_nodes():
+    # 1 <-> 2 <-> 3 is strongly connected; 4 is only reachable one way.
+    edges = [
+        RoadEdge(0, 1, 2, 10, 1),
+        RoadEdge(1, 2, 1, 10, 1),
+        RoadEdge(2, 2, 3, 10, 1),
+        RoadEdge(3, 3, 2, 10, 1),
+        RoadEdge(4, 3, 4, 10, 1),
+        RoadEdge(5, 8, 9, 10, 1),
+        RoadEdge(6, 9, 8, 10, 1),
+    ]
+    assert Router((1, 2, 3, 4, 8, 9), edges).largest_component_nodes() == {1, 2, 3}

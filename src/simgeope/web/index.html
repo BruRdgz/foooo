@@ -21,6 +21,52 @@
       <label><input type="checkbox" data-layer="facilities" checked>Facilities</label>
       <label><input type="checkbox" data-layer="environment">Environment: water distance</label>
     </fieldset>
+    <fieldset id="sim" hidden><legend>Simulação H5N1</legend>
+      <div class="buttons">
+        <button id="sim-step">Passo</button>
+        <button id="sim-run">Rodar</button>
+        <button id="sim-reset">Configurar</button>
+      </div>
+      <label for="sim-seed">Semente</label><input id="sim-seed" type="number" min="0" step="1">
+      <output id="sim-state">Carregando…</output>
+      <figure class="chart">
+        <figcaption>Granjas por situação</figcaption>
+        <div class="legend">
+          <span><i style="background:#2a78d6"></i>infectadas</span>
+          <span><i style="background:#eb6834"></i>em quarentena</span>
+          <span><i style="background:#1baf7a"></i>sacrificadas</span>
+        </div>
+        <svg id="chart-farms" role="img" aria-label="Granjas infectadas, em quarentena e sacrificadas por dia"></svg>
+        <output id="chart-farms-readout"></output>
+      </figure>
+      <figure class="chart">
+        <figcaption>Aves silvestres infectadas</figcaption>
+        <svg id="chart-birds" role="img" aria-label="Aves silvestres infectadas por dia"></svg>
+        <output id="chart-birds-readout"></output>
+      </figure>
+      <div class="legend">
+        <span><i style="background:#2e9e44"></i>saudável</span>
+        <span><i style="background:#e3c21b"></i>quarentena</span>
+        <span><i style="background:#ef8a17"></i>oculta</span>
+        <span><i style="background:#d62d20"></i>notificada</span>
+        <span><i style="background:#222"></i>sacrificada</span>
+      </div>
+      <label><input type="checkbox" data-layer="simFarms" checked>Granjas</label>
+      <label><input type="checkbox" data-layer="simHubs" checked>Bases (fábricas, abatedouros)</label>
+      <label><input type="checkbox" data-layer="simTrucks" checked>Rotas dos caminhões (hoje)</label>
+      <label><input type="checkbox" data-layer="simBirds" checked>Aves silvestres (azul suscetível · rosa infectada · cinza recuperada)</label>
+      <label><input type="checkbox" data-layer="simRisk" checked>Risco de infecção</label>
+      <label><input type="checkbox" data-layer="simInterventions" checked>Raio de sacrifício sanitário</label>
+      <label for="sim-action">Intervenção na granja selecionada</label>
+      <select id="sim-action">
+        <option value="stamping_out">Sacrifício sanitário</option>
+        <option value="movement_block">Bloqueio de movimentação</option>
+        <option value="biosecurity_boost">Melhoria de biosseguridade</option>
+      </select>
+      <output id="sim-selected">Clique numa granja para selecioná-la.</output>
+      <button id="sim-intervene" disabled>Aplicar intervenção</button>
+      <details open><summary>Log da simulação</summary><pre id="sim-log"></pre></details>
+    </fieldset>
     <fieldset><legend>Route debug</legend>
       <p>Choose A/B, then click two points or facilities.</p>
       <div class="buttons"><button id="choose-route">Choose A / B</button><button id="clear-route">Clear</button></div>

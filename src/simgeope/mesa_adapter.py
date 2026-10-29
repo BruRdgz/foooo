@@ -46,6 +46,9 @@ class WorldModel(mesa.Model):
     def travel_time(self, origin, destination, *, state=None):
         return self.world.travel_time(origin, destination, state=state)
 
+    def travel_times(self, origin, destinations, *, state=None):
+        return self.world.travel_times(origin, destinations, state=state)
+
     def environment_at(self, location):
         return self.world.environment_at(location)
 

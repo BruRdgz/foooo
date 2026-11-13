@@ -758,6 +758,14 @@ road-hydro crossings
 
 Do not require every statewide road edge to be sent to the browser in one giant GeoJSON response if it is impractical. Use bounding-box filtering, simplification, vector tiling, or another straightforward approach if needed. Keep the implementation proportional to the dataset.
 
+### 13.4 Simulation dashboard (`--simulate`)
+
+When served with `--simulate`, the same page becomes a dashboard for the H5N1 scenario: KPI strip, playback and day replay, farm-status/Rt/incidence/cost/pathway charts, a farm detail card with manual interventions, a filterable event timeline, and a scenario editor for `ModelParams`. World inspection (layers, A/B route debug, point query) stays available as a separate mode.
+
+- The dashboard only renders data and forwards user actions to `/api/sim/*`; transmission, surveillance and intervention rules stay in `simgeope.simulation`.
+- Day replay reads snapshots kept by the API session (bounded retention), not model state.
+- Same technology constraints as §13.2: plain HTML/CSS/JS, MapLibre, no bundler.
+
 ### 13.4 Inspection interactions
 
 Minimum useful interactions:
@@ -1184,7 +1192,7 @@ The milestone is done when:
 - Avoid introducing services/databases unless clearly necessary.
 - Avoid runtime HTTP dependencies.
 - Prefer local, pinned source files and explicit rebuild commands.
-- Keep the required viewer narrow: inspection/debug only. Do not broaden it into a full simulation dashboard, disease modeling UI, scenario editor, or generic GIS tooling.
+- Keep the world viewer narrow: inspection/debug only, and no generic GIS tooling. The H5N1 simulation dashboard (§13.4) is the one sanctioned extension and must stay a client of the simulation API, never a home for model rules.
 - Do not make every geographic feature a Mesa agent.
 - Do not model movement on a 2D cellular grid when a road graph already represents the relevant topology.
 - Keep geospatial preprocessing out of the simulation hot loop.

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import NamedTuple
 
 from mesa import Agent
 
@@ -97,7 +98,56 @@ def fomite_introduction_prob(params, *, load: float, biosecurity: float) -> floa
     )
 
 
+# ============================================================ PROVENANCE
+
+# Transmission pathway of every farm introduction event.
+INTRODUCTION_PATHWAYS = {
+    "INTRODUCAO_INICIAL": "initial",
+    "INTRODUCAO_FOMITE": "fomite",
+    "INTRODUCAO_VIZINHANCA": "local",
+    "INTRODUCAO_AVES_MIGRATORIAS": "bird",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class Transmission:
+    """Who introduced infection into a farm, according to the model's rules.
+
+    Fomite: the farm whose shedding set the truck's load, the hub whose
+    environment passed it on (None if the truck carried it straight from that
+    farm) and the truck; share 1.0, since loads mix by maximum. Local: the
+    neighbour with the largest hazard and its share of the total hazard (a
+    dominant source, not a certainty). Bird: the nearest infected wild bird.
+    Initial seeding has no source.
+    """
+
+    day: int
+    farm_id: str
+    pathway: str
+    source_farm_id: str | None
+    hub_id: str | None
+    truck_id: str | None
+    bird_id: str | None
+    share: float | None
+
+
+class FomiteSource(NamedTuple):
+    """Origin of a truck or hub load: the shedding farm and any relaying hub."""
+
+    farm_id: str
+    via_hub_id: str | None
+
+
 # ==================================================================== FARM
+
+# Every value of ``FarmAgent.status``.
+FARM_STATUSES = ("healthy", "quarantined", "hidden", "notified", "culled")
+# Emergency-area rings of the official protocol, most restrictive first.
+ZONE_RINGS = ("perifoco", "vigilancia", "protecao")
+# Rings where every truck stop is followed by vehicle disinfection.
+DISINFECTION_RINGS = ("perifoco", "vigilancia")
+# Hub kind whose trucks carry live birds to slaughter, after a clinical exam.
+SLAUGHTER_HUB_KIND = "slaughterhouse"
 
 
 class FarmAgent(Agent):
@@ -134,7 +184,17 @@ class FarmAgent(Agent):
         self.quarantine_day: int = -1
         self.infection_end_day: int = -1
         self.culled: bool = False
+        self.cull_day: int = -1
         self.under_biosec_boost: bool = False
+
+        # official protocol, set by the model at the end of each day
+        self.zone: str | None = None  # most restrictive ring, see ZONE_RINGS
+        self.zone_since: int = -1  # day `zone` took its current value
+        self.focus: bool = False  # an active confirmed focus
+        self.standstill: bool = False  # inside a focus's initial standstill
+        # This infection's detection day was brought forward by active
+        # surveillance in the farm's zone.
+        self.surveillance_detection: bool = False
 
         model.agents_by_id[farm_id] = self
 
@@ -206,6 +266,7 @@ class FarmAgent(Agent):
             self.model.log_event(
                 "INFECCAO",
                 f"Granja {self.farm_id}: +{new_exp:.1f} aves expostas",
+                farm_id=self.farm_id,
             )
 
         if new_exp > 0 and self.first_infection_day == -1:
@@ -221,12 +282,30 @@ class FarmAgent(Agent):
         # A later reintroduction is a new outbreak with its own detection.
         self.first_infection_day = self.detection_day = self.reaction_day = -1
         self.notified = False
+        self.surveillance_detection = False
         self.model.log_event(
-            "FIM_INFECCAO", f"Granja {self.farm_id}: sem aves infectadas"
+            "FIM_INFECCAO",
+            f"Granja {self.farm_id}: sem aves infectadas",
+            farm_id=self.farm_id,
         )
 
     # ------------------------------------------------ external infection
-    def seed_from_external(self, seed_size: float, source: str) -> bool:
+    def seed_from_external(
+        self,
+        seed_size: float,
+        source: str,
+        *,
+        source_farm_id: str | None = None,
+        hub_id: str | None = None,
+        truck_id: str | None = None,
+        bird_id: str | None = None,
+        share: float | None = None,
+    ) -> bool:
+        """Expose `seed_size` birds via introduction event `source`.
+
+        Returns whether the introduction happened; only then is it logged and
+        appended to ``model.transmissions`` with the given provenance.
+        """
         if self.culled or self.quarantined or self.susceptible <= 0:
             return False
 
@@ -242,6 +321,19 @@ class FarmAgent(Agent):
         self.model.log_event(
             source,
             f"Granja {self.farm_id}: exposição via {source} (+{seed:.0f})",
+            farm_id=self.farm_id,
+        )
+        self.model.transmissions.append(
+            Transmission(
+                day=self.model.day_count,
+                farm_id=self.farm_id,
+                pathway=INTRODUCTION_PATHWAYS[source],
+                source_farm_id=source_farm_id,
+                hub_id=hub_id,
+                truck_id=truck_id,
+                bird_id=bird_id,
+                share=share,
+            )
         )
         if self.first_infection_day == -1:
             self._start_infection_clock()
@@ -269,6 +361,7 @@ class FarmAgent(Agent):
             self.model.log_event(
                 "DETECCAO",
                 f"Granja {self.farm_id} notificada às autoridades",
+                farm_id=self.farm_id,
             )
 
     def start_quarantine(self) -> None:
@@ -283,6 +376,7 @@ class FarmAgent(Agent):
                 self.model.log_event(
                     "REACAO_AUTOMATICA",
                     f"Granja {self.farm_id}: bloqueio automático aplicado",
+                    farm_id=self.farm_id,
                 )
 
     def try_release_quarantine(self) -> None:
@@ -297,10 +391,12 @@ class FarmAgent(Agent):
             self.model.log_event(
                 "LIBERACAO_QUARENTENA",
                 f"Granja {self.farm_id}: quarentena encerrada",
+                farm_id=self.farm_id,
             )
 
     # ---------------------------------------------------- interventions
-    def apply_stamping_out(self) -> None:
+    def _cull(self) -> float:
+        """Cull every living bird, paying for each; returns how many."""
         p = self.model.params
         cull_count = self.susceptible + self.exposed + self.infected
         self.model.cumulative_cost += cull_count * p.cull_cost_per_bird
@@ -310,11 +406,27 @@ class FarmAgent(Agent):
         self.exposed = 0.0
         self.infected = 0.0
         self.culled = True
+        self.cull_day = self.model.day_count
         self.start_quarantine()
+        return cull_count
 
+    def depopulate(self) -> None:
+        """Depopulate a confirmed focus (official protocol), sparing neighbours."""
+        cull_count = self._cull()
+        self.model.log_event(
+            "DESPOVOAMENTO",
+            f"Granja {self.farm_id}: foco despovoado, {cull_count:.0f} aves "
+            "sacrificadas",
+            farm_id=self.farm_id,
+        )
+
+    def apply_stamping_out(self) -> None:
+        p = self.model.params
+        cull_count = self._cull()
         self.model.log_event(
             "SACRIFICIO_SANITARIO",
             f"Granja {self.farm_id}: {cull_count:.0f} aves sacrificadas",
+            farm_id=self.farm_id,
         )
 
         for other in self.model.farms_near(self, p.stamping_out_radius_km):
@@ -324,6 +436,7 @@ class FarmAgent(Agent):
             self.model.log_event(
                 "QUARENTENA_PERIFERICA",
                 f"Granja {other.farm_id}: quarentena por raio de sacrifício",
+                farm_id=other.farm_id,
             )
 
     def apply_movement_block(self) -> None:
@@ -331,6 +444,7 @@ class FarmAgent(Agent):
         self.model.log_event(
             "BLOQUEIO_MOVIMENTACAO",
             f"Granja {self.farm_id}: movimentação suspensa manualmente",
+            farm_id=self.farm_id,
         )
 
     def apply_biosecurity_boost(self) -> None:
@@ -341,6 +455,7 @@ class FarmAgent(Agent):
         self.model.log_event(
             "MELHORIA_BIOSSEGURANCA",
             f"Granja {self.farm_id}: biosseguridade -> {self.biosecurity:.0f}%",
+            farm_id=self.farm_id,
         )
 
 
@@ -437,6 +552,10 @@ class HubAgent(Agent):
         self.hub_id = hub_id
         self.facility = facility
         self.load: float = 0.0
+        # Set whenever load > 0; its via_hub_id is irrelevant at the hub.
+        self.load_source: FomiteSource | None = None
+        # Official protocol ring, set by the model like ``FarmAgent.zone``.
+        self.zone: str | None = None
 
         model.agents_by_id[hub_id] = self
 
@@ -484,6 +603,9 @@ class TruckAgent(Agent):
     fit in the shift (travel, service and the drive back), then return. The
     fomite load is continuous in [0, 1]: picked up at infected farms, exchanged
     with the base hub, decayed daily and cleared by disinfection at the base.
+
+    With the official protocol on, trucks also follow the emergency areas the
+    model set at the end of the previous day (see ``_barred`` and ``_arrive``).
     """
 
     def __init__(
@@ -518,6 +640,9 @@ class TruckAgent(Agent):
         self.next_client: int = 0
         self.position: HubAgent | FarmAgent = base
         self.load: float = 0.0
+        # Set whenever load > 0. Loads mix by maximum, so the current value
+        # always comes from one origin; ties keep the existing one.
+        self.load_source: FomiteSource | None = None
 
         model.agents_by_id[truck_id] = self
 
@@ -538,18 +663,26 @@ class TruckAgent(Agent):
     def step(self) -> None:
         p = self.model.params
         self.load = decayed_fomite_load(self.load, p.fomite_survival_days)
+        if self.load == 0:
+            self.load_source = None
 
         shift_s = p.truck_shift_hours * 3600.0
         service_s = p.truck_service_minutes * 60.0
         elapsed_s = 0.0
         stops = 0
+        protocol = bool(p.protocol_enabled)
+        # A truck that stopped inside an emergency area is dedicated to it for
+        # the rest of the day.
+        inside_area = False
         for _ in range(len(self.clients)):
             if stops >= self.max_stops_per_day:
                 break
             farm = self.clients[self.next_client]
-            if farm.culled or farm.quarantined:
+            if farm.culled or farm.quarantined or (protocol and self._barred(farm)):
                 self._advance_rotation()
                 continue
+            if inside_area and farm.zone is None:
+                break  # left as tomorrow's first stop, like one beyond the shift
             go_s = self.model.stop_travel_time_s(self.position, farm)
             back_s = self.model.stop_travel_time_s(farm, self.base)
             # Leave it as tomorrow's first stop; assignment guarantees a
@@ -560,6 +693,7 @@ class TruckAgent(Agent):
             self._arrive(farm, go_s)
             self._advance_rotation()
             stops += 1
+            inside_area = protocol and (inside_area or farm.zone is not None)
 
         if self.position is not self.base:
             self._arrive(
@@ -569,13 +703,37 @@ class TruckAgent(Agent):
     def _advance_rotation(self) -> None:
         self.next_client = (self.next_client + 1) % len(self.clients)
 
+    def _barred(self, farm: FarmAgent) -> bool:
+        """Whether the official protocol forbids stopping at `farm` today.
+
+        No stops inside a focus's protection radius during its standstill;
+        slaughter trucks refuse perifoco farms whose birds would fail the
+        clinical exam (notified farms; hidden infections pass it).
+        """
+        return farm.standstill or (
+            self.base.kind == SLAUGHTER_HUB_KIND
+            and farm.zone == "perifoco"
+            and farm.notified
+        )
+
+    def _zone_disinfection(self) -> None:
+        if self.random.random() < self.model.params.zone_disinfection_prob:
+            self.load, self.load_source = 0.0, None
+
     def _arrive(self, stop: HubAgent | FarmAgent, travel_time_s: float) -> None:
+        protocol = self.model.params.protocol_enabled
+        # Official protocol: disinfection at the emergency-area perimeter...
+        if protocol and (self.position.zone is None) != (stop.zone is None):
+            self._zone_disinfection()
         load_on_arrival = self.load
         introduced = (
             self._exchange_at_farm(stop)
             if isinstance(stop, FarmAgent)
             else self._exchange_at_base()
         )
+        # ...and on leaving every farm in the perifoco or vigilância rings.
+        if protocol and isinstance(stop, FarmAgent) and stop.zone in DISINFECTION_RINGS:
+            self._zone_disinfection()
         self.model.movements.append(
             TruckMovement(
                 day=self.model.day_count,
@@ -597,18 +755,37 @@ class TruckAgent(Agent):
                 p, load=self.load, biosecurity=farm.biosecurity
             )
             if self.random.random() < prob:
+                source = self.load_source
                 introduced = farm.seed_from_external(
-                    p.seed_size_fomite, "INTRODUCAO_FOMITE"
+                    p.seed_size_fomite,
+                    "INTRODUCAO_FOMITE",
+                    source_farm_id=None if source is None else source.farm_id,
+                    hub_id=None if source is None else source.via_hub_id,
+                    truck_id=self.truck_id,
+                    share=1.0,
                 )
-        self.load = max(self.load, farm.shedding())
+        shedding = farm.shedding()
+        if shedding > self.load:
+            self.load_source = FomiteSource(farm.farm_id, None)
+        self.load = max(self.load, shedding)
         return introduced
 
     def _exchange_at_base(self) -> bool:
         p = self.model.params
         hub = self.base
-        hub.load = max(hub.load, p.hub_transfer_fraction * self.load)
+        deposit = p.hub_transfer_fraction * self.load
+        if deposit > hub.load:
+            hub.load_source = self.load_source
+        hub.load = max(hub.load, deposit)
         if self.random.random() < p.truck_disinfection_prob:
-            self.load = 0.0
+            self.load, self.load_source = 0.0, None
         else:
-            self.load = max(self.load, p.hub_transfer_fraction * hub.load)
+            pickup = p.hub_transfer_fraction * hub.load
+            if pickup > self.load:
+                self.load_source = (
+                    None
+                    if hub.load_source is None
+                    else FomiteSource(hub.load_source.farm_id, hub.hub_id)
+                )
+            self.load = max(self.load, pickup)
         return False

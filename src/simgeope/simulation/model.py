@@ -7,9 +7,10 @@ import math
 import warnings
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import astuple, fields
+from dataclasses import astuple, dataclass, fields
+from itertools import takewhile
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 from scipy.spatial import cKDTree
@@ -20,9 +21,12 @@ from simgeope.world.exceptions import NoRoadNearbyError, WorldDataMissingError
 from simgeope.world.facilities import Facility, FacilityIndex, snap_facility
 
 from .agents import (
+    FARM_STATUSES,
+    ZONE_RINGS,
     BirdAgent,
     FarmAgent,
     HubAgent,
+    Transmission,
     TruckAgent,
     TruckMovement,
     bird_introduction_prob,
@@ -66,6 +70,87 @@ FLOCK_SPREAD_M = 300.0
 # Width given to mapped water lines (rivers, canals, coastline) when weighing
 # them against water polygons as bird arrival sites.
 NOMINAL_WATERLINE_WIDTH_M = 50.0
+# Farm introduction pathways counted per day in the history rows.
+INTRODUCTION_EVENTS = (
+    "INTRODUCAO_FOMITE",
+    "INTRODUCAO_VIZINHANCA",
+    "INTRODUCAO_AVES_MIGRATORIAS",
+)
+
+
+class Event(NamedTuple):
+    """One log entry; `farm_id` is set for farm-scoped events, else None."""
+
+    day: int
+    kind: str
+    details: str
+    farm_id: str | None
+
+
+class FlockArrival(NamedTuple):
+    """A migratory flock landing at (lon, lat); infected flocks carry one I bird."""
+
+    day: int
+    lon: float
+    lat: float
+    size: int
+    infected: bool
+
+
+@dataclass(slots=True)
+class Focus:
+    """A confirmed focus of the official protocol and its emergency area.
+
+    The area is active from `confirmed_day` until the day before
+    `release_day`, which stays None until it is known: when the farm is
+    culled, or when its infection ends if it is never depopulated.
+    """
+
+    farm_id: str
+    confirmed_day: int
+    depopulated_day: int | None
+    release_day: int | None
+
+    def active_on(self, day: int) -> bool:
+        return self.confirmed_day <= day and (
+            self.release_day is None or day < self.release_day
+        )
+
+    def standstill_on(self, day: int, standstill_days: int) -> bool:
+        """Whether, at the end of `day`, trucks are barred from the area.
+
+        The model applies it to the next day's trips, so a standstill of S
+        days stops truck stops on days confirmed_day + 1 .. confirmed_day + S.
+        """
+        return self.active_on(day) and day < self.confirmed_day + standstill_days
+
+
+def ring_index(distances_m: np.ndarray, params: ModelParams) -> np.ndarray:
+    """Index into ``ZONE_RINGS`` of each distance from a focus.
+
+    Boundaries belong to the inner ring; ``len(ZONE_RINGS)`` means beyond the
+    protection radius. Radii are measured from the focus, not ring widths.
+    """
+    radii_m = 1000.0 * np.array(
+        [
+            params.perifocus_radius_km,
+            params.surveillance_radius_km,
+            params.protection_radius_km,
+        ]
+    )
+    return np.searchsorted(radii_m, distances_m, side="left")
+
+
+def dominant_source(hazards: Sequence[float]) -> tuple[int, float]:
+    """Index of the largest hazard (the first on ties) and its share of the total.
+
+    Hazards are -log(1 - p) of independent sources. Certain sources (p = 1,
+    infinite hazard) split the attribution equally among themselves.
+    """
+    top = max(range(len(hazards)), key=hazards.__getitem__)
+    if math.isinf(hazards[top]):
+        return top, 1.0 / sum(math.isinf(h) for h in hazards)
+    return top, hazards[top] / math.fsum(hazards)
 
 
 class AgentModel(WorldModel):
@@ -88,6 +173,13 @@ class AgentModel(WorldModel):
         self.hubs: list[HubAgent] = []
         self.trucks: list[TruckAgent] = []
         self.movements: list[TruckMovement] = []
+        # Provenance of every farm introduction, in event order.
+        self.transmissions: list[Transmission] = []
+        self.flock_arrivals: list[FlockArrival] = []
+        # Official protocol: confirmed foci in confirmation order, and notified
+        # farms awaiting confirmation as (due day, farm) in notification order.
+        self.foci: list[Focus] = []
+        self._pending_foci: list[tuple[int, FarmAgent]] = []
         self._farms_by_facility_id: dict[str, FarmAgent] = {}
         # Origin road node -> travel times to every stop node (see below).
         self._stop_node_index: dict[int, int] | None = None
@@ -104,8 +196,8 @@ class AgentModel(WorldModel):
         self.wild_bird_deaths: int = 0
         self.birds_arrived: int = 0
         self.flocks_arrived: int = 0
-        # One summary row per simulated day, for plots.
-        self.history: list[dict[str, float]] = []
+        # One summary row per day from day 0, for plots.
+        self.history: list[dict[str, float | dict[str, int]]] = []
         self._bird_serial = 0
         self._state_metric = None
         self._water_cache: tuple[list, np.ndarray] | None = None
@@ -113,14 +205,15 @@ class AgentModel(WorldModel):
         self._farm_xy: np.ndarray | None = None
         self._farm_tree: cKDTree | None = None
 
-        # (dia, tipo_evento, detalhes), mirrored to the CSV log when configured.
-        self.events: list[tuple[int, str, str]] = []
+        # Mirrored to the CSV log (dia, tipo_evento, detalhes, granja) when
+        # configured.
+        self.events: list[Event] = []
         self.log_path = Path(log_path) if log_path is not None else None
         if self.log_path is not None:
             if self.log_path.exists():
                 self.log_path.unlink()
             with self.log_path.open("w", newline="") as fh:
-                csv.writer(fh).writerow(["dia", "tipo_evento", "detalhes"])
+                csv.writer(fh).writerow(["dia", "tipo_evento", "detalhes", "granja"])
 
     # ========================================================= registries
     def _ensure_available_id(self, agent_id: str) -> None:
@@ -409,10 +502,15 @@ class AgentModel(WorldModel):
         return trucks
 
     def seed_initial_outbreak(self) -> None:
-        if not self.farms:
-            return
-        farm = self.random.choice(self.farms)
-        farm.seed_from_external(self.params.initial_infected, "INTRODUCAO_INICIAL")
+        """Expose one random farm and record the day-0 history row.
+
+        This is the last setup step, so like NetLogo's ``reset-ticks`` it plots
+        the initial state and charts start at day 0.
+        """
+        if self.farms:
+            farm = self.random.choice(self.farms)
+            farm.seed_from_external(self.params.initial_infected, "INTRODUCAO_INICIAL")
+        self._record_history()
 
     def farm_by_id(self, farm_id: str) -> FarmAgent | None:
         return self._farms_by_facility_id.get(farm_id)
@@ -511,11 +609,25 @@ class AgentModel(WorldModel):
 
         for h in self.hubs:
             h.load = decayed_fomite_load(h.load, self.params.fomite_survival_days)
+            if h.load == 0:
+                h.load_source = None
         for t in self.trucks:
             t.step()
 
+        protocol = bool(self.params.protocol_enabled)
+        if protocol:
+            self._active_surveillance()
+            was_notified = [f.notified for f in self.farms]
         for f in self.farms:
             f.try_notify()
+        if protocol:
+            self._update_protocol(
+                [
+                    f
+                    for f, before in zip(self.farms, was_notified, strict=True)
+                    if f.notified and not before
+                ]
+            )
         for f in self.farms:
             f.try_quarantine()
             f.try_release_quarantine()
@@ -534,19 +646,28 @@ class AgentModel(WorldModel):
     def _bird_to_farm(self) -> None:
         p = self.params
         radius_m = p.bird_farm_proximity_km * 1000.0
+        infected = [b for b in self.birds if b.bird_state == "I"]
         for farm in self.farms:
             if farm.culled or farm.quarantined or farm.susceptible <= 0:
                 continue
             here = farm.location
-            if not any(
-                b.bird_state == "I" and self.distance_m(here, b.location) <= radius_m
-                for b in self.birds
-            ):
+            # The nearest infected bird (first in list order on ties) is the
+            # attributed source.
+            distance, nearest = min(
+                (
+                    (self.distance_m(here, bird.location), k)
+                    for k, bird in enumerate(infected)
+                ),
+                default=(math.inf, -1),
+            )
+            if distance > radius_m:
                 continue
             prob = bird_introduction_prob(p, near_water=self.farm_near_water(farm))
             if self.random.random() < prob:
                 farm.seed_from_external(
-                    p.seed_size_birds, "INTRODUCAO_AVES_MIGRATORIAS"
+                    p.seed_size_birds,
+                    "INTRODUCAO_AVES_MIGRATORIAS",
+                    bird_id=infected[nearest].bird_id,
                 )
 
     def _bird_arrivals(self) -> None:
@@ -562,6 +683,9 @@ class AgentModel(WorldModel):
             self.flocks_arrived += 1
             infected = self.random.random() * 100 < p.migratory_infected_pct
             size = 1 + int(self.rng.poisson(max(p.flock_size_mean - 1.0, 0.0)))
+            self.flock_arrivals.append(
+                FlockArrival(self.day_count, site[0], site[1], size, infected)
+            )
             x, y = sp.project(site)
             for k in range(size):
                 location = sp.unproject(
@@ -628,6 +752,9 @@ class AgentModel(WorldModel):
         if tree is None:
             return
         escape: dict[int, float] = {}
+        # Each target's sources (farm order) and their hazards, for attribution.
+        sources: dict[int, list[int]] = {}
+        hazards: dict[int, list[float]] = {}
         for i, source in enumerate(self.farms):
             shedding = 0.0 if source.culled else source.shedding()
             if shedding <= 0:
@@ -648,38 +775,176 @@ class AgentModel(WorldModel):
                     biosecurity=target.biosecurity,
                 )
                 escape[j] = escape.get(j, 1.0) * (1.0 - prob)
+                sources.setdefault(j, []).append(i)
+                hazards.setdefault(j, []).append(
+                    -math.log1p(-prob) if prob < 1.0 else math.inf
+                )
         for j in sorted(escape):
             if self.random.random() < 1.0 - escape[j]:
+                top, share = dominant_source(hazards[j])
                 self.farms[j].seed_from_external(
-                    p.seed_size_local, "INTRODUCAO_VIZINHANCA"
+                    p.seed_size_local,
+                    "INTRODUCAO_VIZINHANCA",
+                    source_farm_id=self.farms[sources[j][top]].farm_id,
+                    share=share,
                 )
 
+    # --------------------------------------------- official protocol (POP)
+    def _active_surveillance(self) -> None:
+        """Bring forward the detection of infections in perifoco/vigilância.
+
+        A surveillance visit finds an infected farm at most the ring's
+        ``*_detection_days`` after it entered the ring or got infected,
+        whichever is later (an infection that starts after the farm entered
+        is found within that many days of starting, not retroactively).
+        The day drawn at infection is kept when it is earlier.
+        """
+        p = self.params
+        deadlines = {
+            "perifoco": p.perifocus_detection_days,
+            "vigilancia": p.surveillance_detection_days,
+        }
+        today = self.day_count
+        for farm in self.farms:
+            days = deadlines.get(farm.zone)
+            if days is None or farm.culled or farm.notified:
+                continue
+            if farm.first_infection_day < 0:
+                continue
+            visit = max(farm.zone_since, farm.first_infection_day) + days
+            visit = max(visit, today)
+            if visit < farm.detection_day:
+                farm.detection_day = visit
+                farm.surveillance_detection = True
+
+    def _update_protocol(self, newly_notified: Sequence[FarmAgent]) -> None:
+        """End-of-day protocol: confirm foci, then rebuild the emergency areas.
+
+        The areas set here govern the next day's truck trips and surveillance.
+        """
+        p = self.params
+        today = self.day_count
+        for farm in newly_notified:
+            if farm.surveillance_detection:
+                self.log_event(
+                    "VIGILANCIA_ATIVA",
+                    f"Granja {farm.farm_id}: infecção encontrada pela vigilância "
+                    f"ativa ({farm.zone})",
+                    farm_id=farm.farm_id,
+                )
+            # Kept even if the infection ends first: the samples were taken.
+            self._pending_foci.append((today + p.confirmation_days, farm))
+        due = [farm for day, farm in self._pending_foci if day <= today]
+        self._pending_foci = [(d, f) for d, f in self._pending_foci if d > today]
+        for farm in due:
+            self._confirm_focus(farm)
+        for focus in self.foci:
+            if focus.release_day is None:
+                self._settle_release(focus)
+        self._update_zones()
+
+    def _confirm_focus(self, farm: FarmAgent) -> None:
+        p = self.params
+        today = self.day_count
+        self.log_event(
+            "FOCO_CONFIRMADO",
+            f"Granja {farm.farm_id}: foco confirmado",
+            farm_id=farm.farm_id,
+        )
+        if p.auto_depopulation and not farm.culled:
+            farm.depopulate()
+        focus = Focus(farm.farm_id, today, None, None)
+        self.foci.append(focus)
+        self._settle_release(focus)
+        if focus.standstill_on(today, p.standstill_days):
+            self.log_event(
+                "INTERDICAO_TRANSITO",
+                f"Foco {farm.farm_id}: trânsito interrompido por "
+                f"{p.standstill_days} dias até {p.protection_radius_km:g} km",
+                farm_id=farm.farm_id,
+            )
+
+    def _settle_release(self, focus: Focus) -> None:
+        """Set the release day once the focus is culled or its infection ends."""
+        farm = self.farm_by_id(focus.farm_id)
+        release_days = self.params.zone_release_days
+        if farm.culled:
+            focus.depopulated_day = farm.cull_day
+            focus.release_day = farm.cull_day + release_days
+        elif farm.exposed + farm.infected <= 0:
+            focus.release_day = farm.infection_end_day + release_days
+
+    def _update_zones(self) -> None:
+        """Each farm's and hub's ring, the most restrictive over active foci.
+
+        Distances are straight lines in the metric CRS. Farms inside the
+        protection radius of a focus in its standstill get ``standstill``.
+        """
+        p = self.params
+        today = self.day_count
+        active = [focus for focus in self.foci if focus.active_on(today)]
+        rows = {farm.farm_id: i for i, farm in enumerate(self.farms)}
+        farm_xy, _ = self._farm_index()
+        sp = self.world.spatial
+        hub_xy = np.array(
+            [sp.project(hub.location) for hub in self.hubs], dtype=float
+        ).reshape(-1, 2)
+        outside = len(ZONE_RINGS)
+        farm_rings = np.full(len(self.farms), outside)
+        hub_rings = np.full(len(self.hubs), outside)
+        standstill = np.zeros(len(self.farms), dtype=bool)
+        for focus in active:
+            centre = farm_xy[rows[focus.farm_id]]
+            rings = ring_index(np.hypot(*(farm_xy - centre).T), p)
+            farm_rings = np.minimum(farm_rings, rings)
+            hub_rings = np.minimum(
+                hub_rings, ring_index(np.hypot(*(hub_xy - centre).T), p)
+            )
+            if focus.standstill_on(today, p.standstill_days):
+                standstill |= rings < outside
+        focus_ids = {focus.farm_id for focus in active}
+        for farm, ring, barred in zip(self.farms, farm_rings, standstill, strict=True):
+            zone = ZONE_RINGS[ring] if ring < outside else None
+            if zone != farm.zone:
+                farm.zone, farm.zone_since = zone, today
+            farm.focus = farm.farm_id in focus_ids
+            farm.standstill = bool(barred)
+        for hub, ring in zip(self.hubs, hub_rings, strict=True):
+            hub.zone = ZONE_RINGS[ring] if ring < outside else None
+
     def _record_history(self) -> None:
+        today = self.day_count
         statuses = Counter(farm.status for farm in self.farms)
+        # Movements and events are appended in day order, so today's records
+        # are the tail of each log.
+        trips = sum(
+            1 for _ in takewhile(lambda m: m.day == today, reversed(self.movements))
+        )
+        todays_kinds = Counter(
+            event.kind
+            for event in takewhile(lambda e: e.day == today, reversed(self.events))
+        )
         self.history.append(
             {
-                "day": self.day_count,
-                **{
-                    status: statuses[status]
-                    for status in (
-                        "healthy",
-                        "quarantined",
-                        "hidden",
-                        "notified",
-                        "culled",
-                    )
-                },
+                "day": today,
+                **{status: statuses[status] for status in FARM_STATUSES},
                 "birds": len(self.birds),
                 "infected_birds": sum(1 for b in self.birds if b.bird_state == "I"),
                 "rt": self.current_rt,
                 "cost": self.cumulative_cost,
+                "new_exposed": sum(f.new_exposed_today for f in self.farms),
+                "deaths": self.total_deaths,
+                "culled_birds": self.total_culled,
+                "trips": trips,
+                "introductions": {
+                    kind: todays_kinds[kind] for kind in INTRODUCTION_EVENTS
+                },
             }
         )
 
     def _update_economic_cost(self) -> None:
         p = self.params
-        active = sum(1 for f in self.farms if f.quarantined and not f.culled)
-        self.cumulative_cost += active * p.quarantine_cost_per_day
+        self.cumulative_cost += self.active_quarantines * p.quarantine_cost_per_day
 
     def _update_rt(self) -> None:
         p = self.params
@@ -706,6 +971,11 @@ class AgentModel(WorldModel):
         )
 
     @property
+    def active_quarantines(self) -> int:
+        """Quarantined farms still standing, which cost quarantine per day."""
+        return sum(1 for f in self.farms if f.quarantined and not f.culled)
+
+    @property
     def hidden_farms(self) -> int:
         return sum(
             1
@@ -714,13 +984,15 @@ class AgentModel(WorldModel):
         )
 
     # ============================================================ logging
-    def log_event(self, tipo: str, detalhes: str) -> None:
-        event = (self.day_count, tipo, detalhes)
+    def log_event(
+        self, tipo: str, detalhes: str, *, farm_id: str | None = None
+    ) -> None:
+        event = Event(self.day_count, tipo, detalhes, farm_id)
         self.events.append(event)
         if self.log_path is None:
             return
         with self.log_path.open("a", newline="") as fh:
-            csv.writer(fh).writerow(event)
+            csv.writer(fh).writerow(event)  # None is written as an empty field
 
     def save_movements(self, path: str | Path) -> None:
         """Write every truck arrival as a CSV contact-network edge list."""

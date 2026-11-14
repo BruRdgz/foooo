@@ -6,23 +6,35 @@ import csv
 import math
 import warnings
 from collections import Counter
-from collections.abc import Mapping, Sequence
-from dataclasses import astuple, fields
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import astuple, dataclass, fields, replace
+from datetime import date, timedelta
+from itertools import takewhile
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 from scipy.spatial import cKDTree
 from shapely.geometry import Point
+from shapely.ops import nearest_points
 
 from simgeope.mesa_adapter import WorldModel
 from simgeope.world.exceptions import NoRoadNearbyError, WorldDataMissingError
 from simgeope.world.facilities import Facility, FacilityIndex, snap_facility
+from simgeope.world.spatial import lon_lat
 
 from .agents import (
+    BROILER_FARM_KIND,
+    CLINICAL_SIGNS_MIN_BIRDS,
+    FARM_STATUSES,
+    HUB_PRODUCTS,
+    LAYER_FARM_KIND,
+    ZONE_RINGS,
     BirdAgent,
     FarmAgent,
     HubAgent,
+    Lot,
+    Transmission,
     TruckAgent,
     TruckMovement,
     bird_introduction_prob,
@@ -61,11 +73,233 @@ def sample_point_in(polygon_metric, uniform, *, attempts: int = 200) -> Point | 
     return None
 
 
+# Year of day 0. Arbitrary: the model is not calibrated to any year; a
+# non-leap year keeps month lengths fixed.
+REFERENCE_YEAR = 2025
 # Standard deviation of landing positions around a flock's arrival site.
 FLOCK_SPREAD_M = 300.0
 # Width given to mapped water lines (rivers, canals, coastline) when weighing
 # them against water polygons as bird arrival sites.
 NOMINAL_WATERLINE_WIDTH_M = 50.0
+# Daily migratory flock arrival rate by calendar month (January first), as a
+# share of migratory_flocks_per_day. It follows the boreal-winter shorebirds
+# and terns, the IAAP alert species of the MAPA contingency plan (§13.1):
+# - May-Jul 0: Arctic breeding season. The few birds counted then at Coroa do
+#   Avião are oversummering young that stayed, not new arrivals (Azevedo Jr.
+#   1992; CEMAVE summary: only young and non-breeders stay in Jun-Jul).
+# - Aug and Apr 0.25: first and last months of the season at Coroa do Avião
+#   ("agosto a abril", Azevedo Jr. 1992); CEMAVE: they arrive "geralmente em
+#   setembro" and stay "até abril".
+# - Sep-Nov 1: arrival peak. Every season maximum at Coroa do Avião was counted
+#   30 Oct-3 Nov 1989 and Sterna hirundo peaks in October (Azevedo Jr. 1992).
+# - Dec-Mar 0.5: wintering presence is documented (Azevedo Jr. 1992; about
+#   3,000 Calidris pusilla at Salgadinho, Olinda, in March 1989) but no
+#   monthly series is.
+# The months come from the sources; the 0.25 and 0.5 levels are assumptions.
+MIGRATORY_ARRIVAL_PROFILE: tuple[float, ...] = (
+    0.5, 0.5, 0.5, 0.25, 0.0, 0.0, 0.0, 0.25, 1.0, 1.0, 1.0, 0.5
+)  # fmt: skip
+MIGRATORY_SITES_CSV = Path(__file__).with_name("reference") / "migracao_sitios_pe.csv"
+# A documented site lands flocks at its nearest mapped water point. Farther
+# than this, that water is another place, and flocks land at water anywhere in
+# the site's municipality instead. Coroa do Avião, an islet in the channel
+# mouth, is ~650 m from mapped water in the Pernambuco world; 3 km tolerates
+# coarser maps while staying well below the size of the municipalities.
+SITE_ANCHOR_MAX_M = 3_000.0
+# Farm introduction pathways counted per day in the history rows.
+INTRODUCTION_EVENTS = (
+    "INTRODUCAO_FOMITE",
+    "INTRODUCAO_VIZINHANCA",
+    "INTRODUCAO_AVES_MIGRATORIAS",
+)
+# Cumulative lot tallies per product, each a lot count and a quantity:
+# shipped from hidden (exposed) or notified farms, recalled (any status),
+# exposed and recalled, exposed but collected before the trace window.
+LOT_TALLIES = (
+    "exposed",
+    "notified",
+    "recalled",
+    "exposed_recalled",
+    "exposed_outside_window",
+)
+# Unit of `Lot.quantity` per product, as shown in event details.
+LOT_UNITS = {"ovos": "dúzias de ovos", "aves": "aves"}
+
+# Synthetic poultry population anchored in official data; sources and
+# limitations in docs/FONTES_DADOS.md.
+# IBGE POG (table 7524), PE, 1st quarter 2025: establishments with at least
+# 10 thousand laying hens, and their hens.
+POG_LAYER_ESTABLISHMENTS = 62
+POG_LAYER_HENS = 13_352_483
+# ADAGRO list of registered poultry farms, February 2022. It does not give
+# the production type; assumption: entries beyond the POG's layer
+# establishments are broiler farms.
+ADAGRO_REGISTERED_FARMS = 267
+# IBGE PPM 2024 (table 3939), PE: galináceos total minus galinhas. It also
+# counts roosters, pullets, chicks and backyard flocks, so the broiler farm
+# population derived from it is an upper bound.
+PPM_BROILER_PROXY_2024 = 52_396_226
+OFFICIAL_FARM_COUNTS = {
+    LAYER_FARM_KIND: POG_LAYER_ESTABLISHMENTS,
+    BROILER_FARM_KIND: ADAGRO_REGISTERED_FARMS - POG_LAYER_ESTABLISHMENTS,
+}
+# Every farm of a type holds that type's mean; no source gives the spread.
+OFFICIAL_FARM_POPULATION = {
+    LAYER_FARM_KIND: round(POG_LAYER_HENS / POG_LAYER_ESTABLISHMENTS),
+    BROILER_FARM_KIND: round(
+        PPM_BROILER_PROXY_2024 / OFFICIAL_FARM_COUNTS[BROILER_FARM_KIND]
+    ),
+}
+# Farms of unknown production type keep the earlier illustrative demo size.
+UNKNOWN_TYPE_FARM_POPULATION = 5_000
+DEFAULT_FARM_POPULATION = {
+    "farm": UNKNOWN_TYPE_FARM_POPULATION,
+    "producer": UNKNOWN_TYPE_FARM_POPULATION,
+    **OFFICIAL_FARM_POPULATION,
+}
+
+
+class Event(NamedTuple):
+    """One log entry; `farm_id` is set for farm-scoped events, else None."""
+
+    day: int
+    kind: str
+    details: str
+    farm_id: str | None
+
+
+class FlockArrival(NamedTuple):
+    """A migratory flock landing at (lon, lat); infected flocks carry one I bird.
+
+    ``site`` names the documented landing site, or is None for a flock landed
+    by the size-weighted water draw.
+    """
+
+    day: int
+    lon: float
+    lat: float
+    size: int
+    infected: bool
+    site: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class MigratorySite:
+    """A documented migratory landing site in Pernambuco.
+
+    ``location`` is None when no source gives a coordinate; flocks then land at
+    mapped water inside the municipality.
+    """
+
+    name: str
+    municipality_code: str
+    location: tuple[float, float] | None
+    weight: float
+
+
+def load_migratory_sites(
+    path: str | Path = MIGRATORY_SITES_CSV,
+) -> tuple[MigratorySite, ...]:
+    """Sites of the versioned reference table, in file order.
+
+    Raises ValueError naming the line of a row with a missing name, a
+    non-Pernambuco municipality code, a lone longitude or latitude, invalid
+    coordinates or a nonpositive weight.
+    """
+    path = Path(path)
+    sites = []
+    with path.open(newline="", encoding="utf-8") as fh:
+        for line, row in enumerate(csv.DictReader(fh), start=2):
+            try:
+                name = row["nome"].strip()
+                code = row["codigo_ibge"].strip()
+                lon, lat = row["lon"].strip(), row["lat"].strip()
+                weight = float(row["peso"])
+                if not name:
+                    raise ValueError("missing site name")
+                if len(code) != 7 or not code.startswith("26") or not code.isdigit():
+                    raise ValueError(f"non-Pernambuco municipality code {code!r}")
+                if bool(lon) != bool(lat):
+                    raise ValueError("lon and lat must be given together")
+                if not (math.isfinite(weight) and weight > 0):
+                    raise ValueError("weight must be positive")
+                location = lon_lat((lon, lat)) if lon else None
+            except (KeyError, ValueError) as exc:
+                raise ValueError(f"{path.name} line {line}: {exc}") from exc
+            sites.append(MigratorySite(name, code, location, weight))
+    return tuple(sites)
+
+
+def _water_weight(geometry_metric) -> float:
+    """Arrival weight of a metric water geometry (see AgentModel._water_sites)."""
+    if geometry_metric.area > 0:
+        return geometry_metric.area
+    return geometry_metric.length * NOMINAL_WATERLINE_WIDTH_M
+
+
+def _simple_parts(geometry) -> list:
+    """Polygon and line parts of a (multi-part or collection) geometry."""
+    if geometry.is_empty:
+        return []
+    if hasattr(geometry, "geoms"):
+        return [part for child in geometry.geoms for part in _simple_parts(child)]
+    return [geometry] if geometry.geom_type in ("Polygon", "LineString") else []
+
+
+@dataclass(slots=True)
+class Focus:
+    """A confirmed focus of the official protocol and its emergency area.
+
+    The area is active from `confirmed_day` until the day before
+    `release_day`, which stays None until it is known: when the farm is
+    culled, or when its infection ends if it is never depopulated.
+    """
+
+    farm_id: str
+    confirmed_day: int
+    depopulated_day: int | None
+    release_day: int | None
+
+    def active_on(self, day: int) -> bool:
+        return self.confirmed_day <= day and (
+            self.release_day is None or day < self.release_day
+        )
+
+    def standstill_on(self, day: int, standstill_days: int) -> bool:
+        """Whether, at the end of `day`, trucks are barred from the area.
+
+        The model applies it to the next day's trips, so a standstill of S
+        days stops truck stops on days confirmed_day + 1 .. confirmed_day + S.
+        """
+        return self.active_on(day) and day < self.confirmed_day + standstill_days
+
+
+def ring_index(distances_m: np.ndarray, params: ModelParams) -> np.ndarray:
+    """Index into ``ZONE_RINGS`` of each distance from a focus.
+
+    Boundaries belong to the inner ring; ``len(ZONE_RINGS)`` means beyond the
+    protection radius. Radii are measured from the focus, not ring widths.
+    """
+    radii_m = 1000.0 * np.array(
+        [
+            params.perifocus_radius_km,
+            params.surveillance_radius_km,
+            params.protection_radius_km,
+        ]
+    )
+    return np.searchsorted(radii_m, distances_m, side="left")
+
+
+def dominant_source(hazards: Sequence[float]) -> tuple[int, float]:
+    """Index of the largest hazard (the first on ties) and its share of the total.
+
+    Hazards are -log(1 - p) of independent sources. Certain sources (p = 1,
+    infinite hazard) split the attribution equally among themselves.
+    """
+    top = max(range(len(hazards)), key=hazards.__getitem__)
+    if math.isinf(hazards[top]):
+        return top, 1.0 / sum(math.isinf(h) for h in hazards)
+    return top, hazards[top] / math.fsum(hazards)
 
 
 class AgentModel(WorldModel):
@@ -88,6 +322,26 @@ class AgentModel(WorldModel):
         self.hubs: list[HubAgent] = []
         self.trucks: list[TruckAgent] = []
         self.movements: list[TruckMovement] = []
+        # Provenance of every farm introduction, in event order.
+        self.transmissions: list[Transmission] = []
+        self.flock_arrivals: list[FlockArrival] = []
+        self.migratory_sites: tuple[MigratorySite, ...] = load_migratory_sites()
+        # Official protocol: confirmed foci in confirmation order, and notified
+        # farms awaiting confirmation as (due day, farm) in notification order.
+        self.foci: list[Focus] = []
+        self._pending_foci: list[tuple[int, FarmAgent]] = []
+        # Product lots in collection order (see _trace_lots). Per farm, the
+        # indices of lots no trace has reached yet; farms being traced, with
+        # their window's first day; and what the last trace call had seen.
+        self.lots: list[Lot] = []
+        self._untraced_lots: dict[str, list[int]] = {}
+        self._tracing: dict[str, int] = {}
+        self._traced_foci = 0
+        self._notified_ids: set[str] = set()
+        # Running (product, tally) totals, so daily history stays O(1).
+        self._lot_counts: Counter[tuple[str, str]] = Counter()
+        self._lot_quantities: Counter[tuple[str, str]] = Counter()
+        self._exposure_days: Counter[str] = Counter()
         self._farms_by_facility_id: dict[str, FarmAgent] = {}
         # Origin road node -> travel times to every stop node (see below).
         self._stop_node_index: dict[int, int] | None = None
@@ -104,23 +358,31 @@ class AgentModel(WorldModel):
         self.wild_bird_deaths: int = 0
         self.birds_arrived: int = 0
         self.flocks_arrived: int = 0
-        # One summary row per simulated day, for plots.
-        self.history: list[dict[str, float]] = []
+        # One summary row per day from day 0, for plots.
+        self.history: list[dict[str, object]] = []
         self._bird_serial = 0
         self._state_metric = None
         self._water_cache: tuple[list, np.ndarray] | None = None
+        # Usable documented sites with their fixed landing point (None: water
+        # in the municipality) and cumulative weights; water per municipality.
+        self._site_cache: (
+            tuple[list[tuple[MigratorySite, tuple[float, float] | None]], np.ndarray]
+            | None
+        ) = None
+        self._municipal_water: dict[str, tuple[list, np.ndarray]] = {}
         # Projected farm coordinates and KD-tree, rebuilt when farms change.
         self._farm_xy: np.ndarray | None = None
         self._farm_tree: cKDTree | None = None
 
-        # (dia, tipo_evento, detalhes), mirrored to the CSV log when configured.
-        self.events: list[tuple[int, str, str]] = []
+        # Mirrored to the CSV log (dia, tipo_evento, detalhes, granja) when
+        # configured.
+        self.events: list[Event] = []
         self.log_path = Path(log_path) if log_path is not None else None
         if self.log_path is not None:
             if self.log_path.exists():
                 self.log_path.unlink()
             with self.log_path.open("w", newline="") as fh:
-                csv.writer(fh).writerow(["dia", "tipo_evento", "detalhes"])
+                csv.writer(fh).writerow(["dia", "tipo_evento", "detalhes", "granja"])
 
     # ========================================================= registries
     def _ensure_available_id(self, agent_id: str) -> None:
@@ -217,15 +479,32 @@ class AgentModel(WorldModel):
         return truck
 
     # ===================================================== scenario setup
-    def add_farms_from_world(self, *, pop_total: int = 5_000) -> int:
+    def add_farms_from_world(
+        self, *, pop_total: int | Mapping[str, int] = DEFAULT_FARM_POPULATION
+    ) -> int:
+        """Register every world facility of a farm kind; returns how many.
+
+        ``pop_total`` is one population for every farm or one per facility
+        kind; a farm kind missing from the mapping is an error, checked
+        before any farm is added.
+        """
         if self.world.facilities is None:
             raise RuntimeError("World has no FacilityIndex loaded")
-        added = 0
-        for facility in self.world.facilities.facilities:
-            if facility.kind in self.params.farm_kinds:
-                self.add_farm(facility, pop_total=pop_total)
-                added += 1
-        return added
+        farms = [
+            facility
+            for facility in self.world.facilities.facilities
+            if facility.kind in self.params.farm_kinds
+        ]
+        if not isinstance(pop_total, int):
+            unknown = ", ".join(sorted({f.kind for f in farms} - set(pop_total)))
+            if unknown:
+                raise ValueError(f"No farm population for kinds: {unknown}")
+        for facility in farms:
+            population = (
+                pop_total if isinstance(pop_total, int) else pop_total[facility.kind]
+            )
+            self.add_farm(facility, pop_total=population)
+        return len(farms)
 
     def add_hubs_from_world(self) -> int:
         """Register every world facility whose kind is a configured fleet base."""
@@ -268,12 +547,7 @@ class AgentModel(WorldModel):
                 hydro.spatial.geometry_to_metric(feature.geometry_wgs84)
                 for feature in hydro.features
             ]
-            weights = np.array(
-                [
-                    g.area if g.area > 0 else g.length * NOMINAL_WATERLINE_WIDTH_M
-                    for g in geometries
-                ]
-            )
+            weights = np.array([_water_weight(g) for g in geometries])
             self._water_cache = (geometries, np.cumsum(weights))
         return self._water_cache
 
@@ -282,10 +556,20 @@ class AgentModel(WorldModel):
         hydro = self.world.hydro
         if hydro is None or not hydro.features:
             return None
-        geometries, cumulative = self._water_sites()
-        if cumulative[-1] <= 0:
+        return self._sample_water_point(
+            *self._water_sites(), self.world.administrative.state_geometry_wgs84
+        )
+
+    def _sample_water_point(
+        self, geometries: list, cumulative: np.ndarray, region_wgs84
+    ) -> tuple[float, float] | None:
+        """A point on a size-weighted pick of metric water `geometries`.
+
+        None when there is no water or 20 picks all fall outside `region_wgs84`.
+        """
+        if not len(cumulative) or cumulative[-1] <= 0:
             return None
-        state = self.world.administrative.state_geometry_wgs84
+        hydro = self.world.hydro
         for _ in range(20):
             index = int(
                 np.searchsorted(cumulative, self.random.random() * cumulative[-1])
@@ -299,9 +583,133 @@ class AgentModel(WorldModel):
             else:
                 point = geometry.interpolate(self.random.random() * geometry.length)
             location = hydro.spatial.unproject((point.x, point.y))
-            if state.covers(Point(location)):
+            if region_wgs84.covers(Point(location)):
                 return location
         return None
+
+    def _landing_sites(
+        self,
+    ) -> tuple[list[tuple[MigratorySite, tuple[float, float] | None]], np.ndarray]:
+        """Documented sites usable in this world, resolved once and cached.
+
+        A site with a coordinate lands flocks at its nearest mapped water point
+        (the coordinate itself without hydrology) when that lies in the state
+        within SITE_ANCHOR_MAX_M; otherwise, or without a coordinate, at water
+        in its municipality. Sites whose municipality is not in the world are
+        dropped. Every fallback is logged as AVISO_AVES.
+        """
+        if self._site_cache is None:
+            codes = {m.code for m in self.world.administrative.municipalities}
+            usable: list[tuple[MigratorySite, tuple[float, float] | None]] = []
+            for site in self.migratory_sites:
+                if site.municipality_code not in codes:
+                    self.log_event(
+                        "AVISO_AVES",
+                        f"Sítio migratório {site.name} ignorado: município "
+                        f"{site.municipality_code} fora do mundo",
+                    )
+                    continue
+                anchor = None
+                if site.location is not None:
+                    anchor = self._site_anchor(site.location)
+                    if anchor is None:
+                        self.log_event(
+                            "AVISO_AVES",
+                            f"Sítio migratório {site.name}: sem água mapeada no "
+                            f"estado a até {SITE_ANCHOR_MAX_M / 1000:g} km; pouso "
+                            "em água do município",
+                        )
+                usable.append((site, anchor))
+            if self.migratory_sites and not usable:
+                self.log_event(
+                    "AVISO_AVES",
+                    "Nenhum sítio migratório conhecido no mundo: todos os bandos "
+                    "pousam pelo sorteio por tamanho do corpo d'água",
+                )
+            weights = np.array([site.weight for site, _ in usable])
+            self._site_cache = (usable, np.cumsum(weights))
+        return self._site_cache
+
+    def _site_anchor(self, location: tuple[float, float]) -> tuple[float, float] | None:
+        """Nearest mapped water point to `location` if in the state and near it."""
+        hydro = self.world.hydro
+        candidate: tuple[float, float] | None = location
+        if hydro is not None and hydro.features:
+            sp = hydro.spatial
+            origin = Point(sp.project(location))
+            best = None
+            # The hydro layer answers lines and bodies separately; keep the
+            # nearer of the two.
+            for feature in (
+                hydro.nearest_waterway(location),
+                hydro.nearest_waterbody(location),
+            ):
+                if feature is None:
+                    continue
+                geometry = sp.geometry_to_metric(feature.geometry_wgs84)
+                if geometry.is_empty:
+                    continue
+                closest = nearest_points(geometry, origin)[0]
+                distance = closest.distance(origin)
+                if best is None or distance < best[0]:
+                    best = (distance, closest)
+            candidate = None if best is None else sp.unproject((best[1].x, best[1].y))
+        state = self.world.administrative.state_geometry_wgs84
+        if (
+            candidate is None
+            or not state.covers(Point(candidate))
+            or self.distance_m(location, candidate) > SITE_ANCHOR_MAX_M
+        ):
+            return None
+        return candidate
+
+    def _municipal_water_point(self, code: str) -> tuple[float, float] | None:
+        """A size-weighted point on mapped water inside a municipality.
+
+        Without mapped water there, a uniform point in the municipality, as
+        state-wide arrivals do without hydrology.
+        """
+        admin = self.world.administrative
+        municipality = next(m for m in admin.municipalities if m.code == code)
+        if code not in self._municipal_water:
+            hydro = self.world.hydro
+            geometries = []
+            for feature in () if hydro is None else hydro.features:
+                if code in feature.municipality_codes:
+                    clipped = feature.geometry_wgs84.intersection(
+                        municipality.geometry_wgs84
+                    )
+                    geometries.extend(
+                        hydro.spatial.geometry_to_metric(part)
+                        for part in _simple_parts(clipped)
+                    )
+            weights = np.array([_water_weight(g) for g in geometries])
+            self._municipal_water[code] = (geometries, np.cumsum(weights))
+        point = self._sample_water_point(
+            *self._municipal_water[code], municipality.geometry_wgs84
+        )
+        if point is None:
+            sampled = sample_point_in(
+                admin.spatial.geometry_to_metric(municipality.geometry_wgs84),
+                self.random.uniform,
+            )
+            if sampled is not None:
+                point = admin.spatial.unproject((sampled.x, sampled.y))
+        return point
+
+    def _documented_site_point(self) -> tuple[str, tuple[float, float]] | None:
+        """A weighted documented site and its landing point, or None if none."""
+        sites, cumulative = self._landing_sites()
+        if not sites:
+            return None
+        index = int(
+            np.searchsorted(
+                cumulative, self.random.random() * cumulative[-1], side="right"
+            )
+        )
+        site, anchor = sites[min(index, len(sites) - 1)]
+        point = anchor or self._municipal_water_point(site.municipality_code)
+        return None if point is None else (site.name, point)
 
     def add_birds_uniform(self, n: int) -> int:
         """Place `n` resident birds uniformly inside the PE state polygon.
@@ -356,7 +764,12 @@ class AgentModel(WorldModel):
         service_s = p.truck_service_minutes * 60.0
         assignment: dict[HubAgent, list[FarmAgent]] = {hub: [] for hub in hubs}
         unserved = 0
-        for farm in sorted(self.farms, key=lambda f: f.farm_id):
+        clients = (
+            self.farms
+            if spec.client_kinds is None
+            else [f for f in self.farms if f.facility.kind in spec.client_kinds]
+        )
+        for farm in sorted(clients, key=lambda f: f.farm_id):
             feasible = []
             for hub in hubs:
                 round_trip_s = (
@@ -409,10 +822,15 @@ class AgentModel(WorldModel):
         return trucks
 
     def seed_initial_outbreak(self) -> None:
-        if not self.farms:
-            return
-        farm = self.random.choice(self.farms)
-        farm.seed_from_external(self.params.initial_infected, "INTRODUCAO_INICIAL")
+        """Expose one random farm and record the day-0 history row.
+
+        This is the last setup step, so like NetLogo's ``reset-ticks`` it plots
+        the initial state and charts start at day 0.
+        """
+        if self.farms:
+            farm = self.random.choice(self.farms)
+            farm.seed_from_external(self.params.initial_infected, "INTRODUCAO_INICIAL")
+        self._record_history()
 
     def farm_by_id(self, farm_id: str) -> FarmAgent | None:
         return self._farms_by_facility_id.get(farm_id)
@@ -511,14 +929,30 @@ class AgentModel(WorldModel):
 
         for h in self.hubs:
             h.load = decayed_fomite_load(h.load, self.params.fomite_survival_days)
+            if h.load == 0:
+                h.load_source = None
         for t in self.trucks:
             t.step()
 
+        protocol = bool(self.params.protocol_enabled)
+        if protocol:
+            self._active_surveillance()
+            was_notified = [f.notified for f in self.farms]
         for f in self.farms:
             f.try_notify()
+        if protocol:
+            self._update_protocol(
+                [
+                    f
+                    for f, before in zip(self.farms, was_notified, strict=True)
+                    if f.notified and not before
+                ]
+            )
+        self._trace_lots()
         for f in self.farms:
             f.try_quarantine()
             f.try_release_quarantine()
+            f.try_restock()
 
         self._update_economic_cost()
         self._update_rt()
@@ -530,38 +964,80 @@ class AgentModel(WorldModel):
         for _ in range(days):
             self.step()
 
+    @property
+    def current_date(self) -> date:
+        """Calendar date of the current day; day 0 is the 1st of ``start_month``."""
+        start = date(REFERENCE_YEAR, self.params.start_month, 1)
+        return start + timedelta(days=self.day_count)
+
     # -------------------------------------------------------- subsystems
     def _bird_to_farm(self) -> None:
         p = self.params
         radius_m = p.bird_farm_proximity_km * 1000.0
+        infected = [b for b in self.birds if b.bird_state == "I"]
         for farm in self.farms:
             if farm.culled or farm.quarantined or farm.susceptible <= 0:
                 continue
             here = farm.location
-            if not any(
-                b.bird_state == "I" and self.distance_m(here, b.location) <= radius_m
-                for b in self.birds
-            ):
+            # The nearest infected bird (first in list order on ties) is the
+            # attributed source.
+            distance, nearest = min(
+                (
+                    (self.distance_m(here, bird.location), k)
+                    for k, bird in enumerate(infected)
+                ),
+                default=(math.inf, -1),
+            )
+            if distance > radius_m:
                 continue
             prob = bird_introduction_prob(p, near_water=self.farm_near_water(farm))
             if self.random.random() < prob:
                 farm.seed_from_external(
-                    p.seed_size_birds, "INTRODUCAO_AVES_MIGRATORIAS"
+                    p.seed_size_birds,
+                    "INTRODUCAO_AVES_MIGRATORIAS",
+                    bird_id=infected[nearest].bird_id,
                 )
 
     def _bird_arrivals(self) -> None:
-        """Migratory flocks land at water (anywhere in the state without hydro)."""
+        """Migratory flocks land at water (anywhere in the state without hydro).
+
+        The day's rate follows MIGRATORY_ARRIVAL_PROFILE for the current month.
+        A ``migratory_site_fraction`` share of flocks lands at the documented
+        sites, by weight; the rest, and all of them when no site is usable,
+        land at size-weighted water.
+        """
         p = self.params
         sp = self.world.spatial
         state = self.world.administrative.state_geometry_wgs84
-        for _ in range(int(self.rng.poisson(p.migratory_flocks_per_day))):
-            site = self._random_water_point() or self._random_state_point()
+        rate = (
+            p.migratory_flocks_per_day
+            * MIGRATORY_ARRIVAL_PROFILE[self.current_date.month - 1]
+        )
+        for _ in range(int(self.rng.poisson(rate))):
+            documented = None
+            # A zero fraction draws nothing, so the size-weighted draw keeps
+            # its random stream.
+            if (
+                p.migratory_site_fraction > 0
+                and self.random.random() < p.migratory_site_fraction
+            ):
+                documented = self._documented_site_point()
+            if documented is not None:
+                site_name, site = documented
+            else:
+                site_name = None
+                site = self._random_water_point() or self._random_state_point()
             if site is None:
                 self.log_event("AVISO_AVES", "Sem ponto para chegada migratória")
                 return
             self.flocks_arrived += 1
             infected = self.random.random() * 100 < p.migratory_infected_pct
             size = 1 + int(self.rng.poisson(max(p.flock_size_mean - 1.0, 0.0)))
+            self.flock_arrivals.append(
+                FlockArrival(
+                    self.day_count, site[0], site[1], size, infected, site_name
+                )
+            )
             x, y = sp.project(site)
             for k in range(size):
                 location = sp.unproject(
@@ -577,9 +1053,10 @@ class AgentModel(WorldModel):
                 if infected and k == 0:
                     bird.infect()
             if infected:
+                where = f" em {site_name}" if site_name else ""
                 self.log_event(
                     "CHEGADA_BANDO_INFECTADO",
-                    f"Bando migratório de {size} aves chegou com ave infectada",
+                    f"Bando migratório de {size} aves chegou com ave infectada{where}",
                 )
 
     def _bird_transmission(self) -> None:
@@ -628,6 +1105,9 @@ class AgentModel(WorldModel):
         if tree is None:
             return
         escape: dict[int, float] = {}
+        # Each target's sources (farm order) and their hazards, for attribution.
+        sources: dict[int, list[int]] = {}
+        hazards: dict[int, list[float]] = {}
         for i, source in enumerate(self.farms):
             shedding = 0.0 if source.culled else source.shedding()
             if shedding <= 0:
@@ -648,38 +1128,309 @@ class AgentModel(WorldModel):
                     biosecurity=target.biosecurity,
                 )
                 escape[j] = escape.get(j, 1.0) * (1.0 - prob)
+                sources.setdefault(j, []).append(i)
+                hazards.setdefault(j, []).append(
+                    -math.log1p(-prob) if prob < 1.0 else math.inf
+                )
         for j in sorted(escape):
             if self.random.random() < 1.0 - escape[j]:
+                top, share = dominant_source(hazards[j])
                 self.farms[j].seed_from_external(
-                    p.seed_size_local, "INTRODUCAO_VIZINHANCA"
+                    p.seed_size_local,
+                    "INTRODUCAO_VIZINHANCA",
+                    source_farm_id=self.farms[sources[j][top]].farm_id,
+                    share=share,
                 )
 
+    # ------------------------------------ official protocol (POP and Plano)
+    def _active_surveillance(self) -> None:
+        """Today's inspections, which notify farms showing clinical signs.
+
+        Every farm in the perifoco or vigilância is inspected each
+        ``perifocus_detection_days``/``surveillance_detection_days`` after
+        entering its ring, and a restocked farm each
+        ``restock_inspection_days`` after restocking (Plano de Contingência
+        IAAP/DNC §7.2-7.3 and §11). Inspections sample only birds with
+        clinical signs, so they find an infection once at least
+        ``CLINICAL_SIGNS_MIN_BIRDS`` are infectious. A finding brings the
+        detection day forward to today; an earlier drawn day is kept.
+        """
+        p = self.params
+        intervals = {
+            "perifoco": p.perifocus_detection_days,
+            "vigilancia": p.surveillance_detection_days,
+        }
+        today = self.day_count
+        for farm in self.farms:
+            if (
+                farm.culled
+                or farm.notified
+                or farm.first_infection_day < 0
+                or farm.infected < CLINICAL_SIGNS_MIN_BIRDS
+                or farm.detection_day <= today
+            ):
+                continue
+            # (start day, interval): the first inspection is one interval
+            # after the farm entered its ring or was restocked.
+            schedules = []
+            if farm.zone in intervals:
+                schedules.append((farm.zone_since, intervals[farm.zone]))
+            if farm.restocked:
+                schedules.append((farm.restock_day, p.restock_inspection_days))
+            if any(
+                today > start and (today - start) % interval == 0
+                for start, interval in schedules
+            ):
+                farm.detection_day = today
+                farm.surveillance_detection = True
+
+    def _update_protocol(self, newly_notified: Sequence[FarmAgent]) -> None:
+        """End-of-day protocol: confirm foci, then rebuild the emergency areas.
+
+        The areas set here govern the next day's truck trips and surveillance.
+        """
+        p = self.params
+        today = self.day_count
+        for farm in newly_notified:
+            if farm.surveillance_detection:
+                where = farm.zone or "monitoramento do repovoamento"
+                self.log_event(
+                    "VIGILANCIA_ATIVA",
+                    f"Granja {farm.farm_id}: infecção encontrada pela vigilância "
+                    f"ativa ({where})",
+                    farm_id=farm.farm_id,
+                )
+            # Kept even if the infection ends first: the samples were taken.
+            self._pending_foci.append((today + p.confirmation_days, farm))
+        due = [farm for day, farm in self._pending_foci if day <= today]
+        self._pending_foci = [(d, f) for d, f in self._pending_foci if d > today]
+        for farm in due:
+            self._confirm_focus(farm)
+        for focus in self.foci:
+            if focus.release_day is None:
+                self._settle_release(focus)
+        self._update_zones()
+
+    def focus_pending(self, farm: FarmAgent) -> bool:
+        """Whether samples of `farm` await laboratory confirmation."""
+        return any(pending is farm for _, pending in self._pending_foci)
+
+    def _confirm_focus(self, farm: FarmAgent) -> None:
+        p = self.params
+        today = self.day_count
+        self.log_event(
+            "FOCO_CONFIRMADO",
+            f"Granja {farm.farm_id}: foco confirmado",
+            farm_id=farm.farm_id,
+        )
+        if p.auto_depopulation and not farm.culled:
+            farm.depopulate()
+        focus = Focus(farm.farm_id, today, None, None)
+        self.foci.append(focus)
+        self._settle_release(focus)
+        if focus.standstill_on(today, p.standstill_days):
+            self.log_event(
+                "INTERDICAO_TRANSITO",
+                f"Foco {farm.farm_id}: trânsito interrompido por "
+                f"{p.standstill_days} dias até {p.protection_radius_km:g} km",
+                farm_id=farm.farm_id,
+            )
+
+    def _settle_release(self, focus: Focus) -> None:
+        """Set the release day once the focus is culled or its infection ends."""
+        farm = self.farm_by_id(focus.farm_id)
+        release_days = self.params.zone_release_days
+        if farm.culled:
+            focus.depopulated_day = farm.cull_day
+            focus.release_day = farm.cull_day + release_days
+        elif farm.exposed + farm.infected <= 0:
+            focus.release_day = farm.infection_end_day + release_days
+
+    def _update_zones(self) -> None:
+        """Each farm's and hub's ring, the most restrictive over active foci.
+
+        Distances are straight lines in the metric CRS. Farms inside the
+        protection radius of a focus in its standstill get ``standstill``.
+        """
+        p = self.params
+        today = self.day_count
+        active = [focus for focus in self.foci if focus.active_on(today)]
+        rows = {farm.farm_id: i for i, farm in enumerate(self.farms)}
+        farm_xy, _ = self._farm_index()
+        sp = self.world.spatial
+        hub_xy = np.array(
+            [sp.project(hub.location) for hub in self.hubs], dtype=float
+        ).reshape(-1, 2)
+        outside = len(ZONE_RINGS)
+        farm_rings = np.full(len(self.farms), outside)
+        hub_rings = np.full(len(self.hubs), outside)
+        standstill = np.zeros(len(self.farms), dtype=bool)
+        for focus in active:
+            centre = farm_xy[rows[focus.farm_id]]
+            rings = ring_index(np.hypot(*(farm_xy - centre).T), p)
+            farm_rings = np.minimum(farm_rings, rings)
+            hub_rings = np.minimum(
+                hub_rings, ring_index(np.hypot(*(hub_xy - centre).T), p)
+            )
+            if focus.standstill_on(today, p.standstill_days):
+                standstill |= rings < outside
+        focus_ids = {focus.farm_id for focus in active}
+        for farm, ring, barred in zip(self.farms, farm_rings, standstill, strict=True):
+            zone = ZONE_RINGS[ring] if ring < outside else None
+            if zone != farm.zone:
+                farm.zone, farm.zone_since = zone, today
+            farm.focus = farm.farm_id in focus_ids
+            farm.standstill = bool(barred)
+        for hub, ring in zip(self.hubs, hub_rings, strict=True):
+            hub.zone = ZONE_RINGS[ring] if ring < outside else None
+
+    # ------------------------------------------- product lots and tracing
+    def record_lot(self, lot: Lot) -> None:
+        """Register a lot collected today, tallying it if its farm was infected."""
+        self._untraced_lots.setdefault(lot.farm_id, []).append(len(self.lots))
+        self.lots.append(lot)
+        if lot.farm_status in ("hidden", "notified"):
+            self._tally(lot, "exposed" if lot.exposed else "notified")
+
+    def _tally(self, lot: Lot, tally: str) -> None:
+        self._lot_counts[lot.product, tally] += 1
+        self._lot_quantities[lot.product, tally] += lot.quantity
+
+    def _trace_lots(self) -> None:
+        """Recall the lots of farms that became foci today (or were notified).
+
+        The trigger is a focus confirmation with the official protocol on and
+        a notification with it off; the window starts ``trace_window_days``
+        before the trigger day. A traced farm keeps having its new lots
+        recalled until it is culled or its infection ends, since a notified
+        farm still ships until it is quarantined.
+        """
+        p = self.params
+        today = self.day_count
+        if p.protocol_enabled:
+            triggers = [
+                (focus.farm_id, focus.confirmed_day)
+                for focus in self.foci[self._traced_foci :]
+            ]
+            self._traced_foci = len(self.foci)
+        else:
+            notified = [farm.farm_id for farm in self.farms if farm.notified]
+            triggers = [
+                (farm_id, today)
+                for farm_id in notified
+                if farm_id not in self._notified_ids
+            ]
+            self._notified_ids = set(notified)
+        for farm_id, day in triggers:
+            self._tracing[farm_id] = day - p.trace_window_days
+        for farm_id, start in list(self._tracing.items()):
+            self._recall(farm_id, start)
+            farm = self.farm_by_id(farm_id)
+            if farm.culled or farm.exposed + farm.infected <= 0:
+                del self._tracing[farm_id]
+
+    def _recall(self, farm_id: str, start: int) -> None:
+        """Settle every untraced lot of `farm_id` against a window from `start`.
+
+        Lots from `start` on are recalled today. Exposed lots collected
+        before it are counted as outside the window; the rest are dropped,
+        since any later trace has a later window.
+        """
+        today = self.day_count
+        recalled: list[Lot] = []
+        outside: list[Lot] = []
+        for i in self._untraced_lots.pop(farm_id, ()):
+            lot = self.lots[i]
+            if lot.day >= start:
+                self.lots[i] = replace(lot, trace="recalled", trace_day=today)
+                recalled.append(lot)
+                self._tally(lot, "recalled")
+                if lot.exposed:
+                    self._tally(lot, "exposed_recalled")
+                    self._exposure_days[lot.product] += today - lot.day
+            elif lot.exposed:
+                self.lots[i] = replace(lot, trace="outside_window", trace_day=today)
+                outside.append(lot)
+                self._tally(lot, "exposed_outside_window")
+        if not recalled and not outside:
+            return
+
+        def amounts(lots: list[Lot]) -> str:
+            totals: Counter[str] = Counter()
+            for lot in lots:
+                totals[lot.product] += lot.quantity
+            return ", ".join(
+                f"{totals[product]:.0f} {LOT_UNITS[product]}"
+                for product in sorted(totals)
+            )
+
+        details = f"Granja {farm_id}: {len(recalled)} lote(s) recolhido(s)"
+        if recalled:
+            details += f" ({amounts(recalled)})"
+        if outside:
+            details += (
+                f"; {len(outside)} lote(s) exposto(s) fora da janela de "
+                f"{self.params.trace_window_days} dias ({amounts(outside)})"
+            )
+        self.log_event("RECOLHIMENTO_LOTES", details, farm_id=farm_id)
+
+    def lot_summary(self) -> dict[str, dict[str, object]]:
+        """Cumulative lot tallies per product (see ``LOT_TALLIES``).
+
+        `mean_exposure_days` averages recall day minus collection day over
+        exposed recalled lots; None until one is recalled.
+        """
+        summary: dict[str, dict[str, object]] = {}
+        for product in HUB_PRODUCTS.values():
+            exposed_recalled = self._lot_counts[product, "exposed_recalled"]
+            summary[product] = {
+                **{
+                    tally: {
+                        "lots": self._lot_counts[product, tally],
+                        "quantity": float(self._lot_quantities[product, tally]),
+                    }
+                    for tally in LOT_TALLIES
+                },
+                "mean_exposure_days": self._exposure_days[product] / exposed_recalled
+                if exposed_recalled
+                else None,
+            }
+        return summary
+
     def _record_history(self) -> None:
+        today = self.day_count
         statuses = Counter(farm.status for farm in self.farms)
+        # Movements and events are appended in day order, so today's records
+        # are the tail of each log.
+        trips = sum(
+            1 for _ in takewhile(lambda m: m.day == today, reversed(self.movements))
+        )
+        todays_kinds = Counter(
+            event.kind
+            for event in takewhile(lambda e: e.day == today, reversed(self.events))
+        )
         self.history.append(
             {
-                "day": self.day_count,
-                **{
-                    status: statuses[status]
-                    for status in (
-                        "healthy",
-                        "quarantined",
-                        "hidden",
-                        "notified",
-                        "culled",
-                    )
-                },
+                "day": today,
+                **{status: statuses[status] for status in FARM_STATUSES},
                 "birds": len(self.birds),
                 "infected_birds": sum(1 for b in self.birds if b.bird_state == "I"),
                 "rt": self.current_rt,
                 "cost": self.cumulative_cost,
+                "new_exposed": sum(f.new_exposed_today for f in self.farms),
+                "deaths": self.total_deaths,
+                "culled_birds": self.total_culled,
+                "trips": trips,
+                "introductions": {
+                    kind: todays_kinds[kind] for kind in INTRODUCTION_EVENTS
+                },
+                "lots": self.lot_summary(),
             }
         )
 
     def _update_economic_cost(self) -> None:
         p = self.params
-        active = sum(1 for f in self.farms if f.quarantined and not f.culled)
-        self.cumulative_cost += active * p.quarantine_cost_per_day
+        self.cumulative_cost += self.active_quarantines * p.quarantine_cost_per_day
 
     def _update_rt(self) -> None:
         p = self.params
@@ -706,6 +1457,11 @@ class AgentModel(WorldModel):
         )
 
     @property
+    def active_quarantines(self) -> int:
+        """Quarantined farms still standing, which cost quarantine per day."""
+        return sum(1 for f in self.farms if f.quarantined and not f.culled)
+
+    @property
     def hidden_farms(self) -> int:
         return sum(
             1
@@ -714,13 +1470,15 @@ class AgentModel(WorldModel):
         )
 
     # ============================================================ logging
-    def log_event(self, tipo: str, detalhes: str) -> None:
-        event = (self.day_count, tipo, detalhes)
+    def log_event(
+        self, tipo: str, detalhes: str, *, farm_id: str | None = None
+    ) -> None:
+        event = Event(self.day_count, tipo, detalhes, farm_id)
         self.events.append(event)
         if self.log_path is None:
             return
         with self.log_path.open("a", newline="") as fh:
-            csv.writer(fh).writerow(event)
+            csv.writer(fh).writerow(event)  # None is written as an empty field
 
     def save_movements(self, path: str | Path) -> None:
         """Write every truck arrival as a CSV contact-network edge list."""
@@ -742,6 +1500,36 @@ DEMO_POULTRY_POLES = (
 )
 # Standard deviation of synthetic facility positions around a pole centre.
 POLE_SIGMA_KM = 4.0
+# Draws allowed per wanted facility, on average, before giving up on the rest.
+PLACEMENT_ATTEMPTS_PER_FACILITY = 200
+# Facility IDs of official-data farms: "P0001" (postura), "C0001" (corte).
+OFFICIAL_FARM_ID_PREFIXES = {LAYER_FARM_KIND: "P", BROILER_FARM_KIND: "C"}
+
+# Per-municipality poultry table built by tools/build_reference_data.py from
+# IBGE and ADAGRO files, with aggregate counts only (docs/FONTES_DADOS.md).
+REFERENCE_TABLE = (
+    Path(__file__).resolve().parent / "reference" / "producao_municipios_pe.csv"
+)
+# Reference column whose head counts weigh each farm kind's municipalities.
+FARM_KIND_WEIGHT_COLUMNS = {
+    LAYER_FARM_KIND: "galinhas_2024",
+    BROILER_FARM_KIND: "corte_proxy_2024",
+}
+
+# Draws a metric point and, when known, the code of its municipality.
+PointDraw = Callable[[], tuple[Point, str | None] | None]
+
+
+def reference_farm_weights(
+    path: str | Path = REFERENCE_TABLE,
+) -> dict[str, dict[str, int]]:
+    """Per farm kind, the reference weight of each municipality code."""
+    with Path(path).open(encoding="utf-8", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    return {
+        kind: {row["codigo_ibge"]: int(row[column]) for row in rows}
+        for kind, column in FARM_KIND_WEIGHT_COLUMNS.items()
+    }
 
 
 def install_synthetic_facilities(
@@ -759,10 +1547,10 @@ def install_synthetic_facilities(
     Samples `n` farms plus ``hubs`` (kind -> count, e.g. feed mills) inside the
     PE state polygon. With ``poles`` (municipality names), ``pole_fraction`` of
     the farms and every hub are drawn around those municipalities (Gaussian,
-    ``POLE_SIGMA_KM``); the rest are uniform by area. With roads, each sample
-    is snapped and rejected unless its node is in the largest strongly
-    connected road component, so all facilities can reach each other. The
-    result is assigned to ``world.facilities``. Intended for tests and demos.
+    ``POLE_SIGMA_KM``); the rest are uniform by area. Placement follows
+    ``_place_facilities``. The result is assigned to ``world.facilities``.
+    Intended for tests and demos; ``install_official_facilities`` places
+    farms by official data.
     """
     if not 0 <= pole_fraction <= 1:
         raise ValueError("pole_fraction must be within [0, 1]")
@@ -779,35 +1567,161 @@ def install_synthetic_facilities(
         sp.geometry_to_metric(by_name[name].geometry_wgs84).representative_point()
         for name in poles
     ]
+
+    def at_pole() -> tuple[Point, None]:
+        centre = centres[int(rng.integers(len(centres)))]
+        sigma = POLE_SIGMA_KM * 1000.0
+        offset = rng.normal(0, sigma), rng.normal(0, sigma)
+        return Point(centre.x + offset[0], centre.y + offset[1]), None
+
+    def anywhere() -> tuple[Point, None] | None:
+        point = sample_point_in(state_metric, rng.uniform, attempts=1)
+        return None if point is None else (point, None)
+
     clustered = round(n * pole_fraction) if centres else 0
-    wanted = [(f"f{i + 1:04d}", kind, i < clustered) for i in range(n)]
+    wanted: list[tuple[str, str, PointDraw]] = [
+        (f"f{i + 1:04d}", kind, at_pole if i < clustered else anywhere)
+        for i in range(n)
+    ]
     for hub_kind, count in sorted((hubs or {}).items()):
         wanted += [
-            (f"{hub_kind}-{i + 1:02d}", hub_kind, bool(centres)) for i in range(count)
+            (f"{hub_kind}-{i + 1:02d}", hub_kind, at_pole if centres else anywhere)
+            for i in range(count)
         ]
+    return _place_facilities(world, wanted)
+
+
+def install_official_facilities(
+    world,
+    fleets: Sequence[FleetSpec],
+    *,
+    farms: Mapping[str, int] = OFFICIAL_FARM_COUNTS,
+    hubs_per_fleet: int = 2,
+    weights: Mapping[str, Mapping[str, int]] | None = None,
+    seed: int | None = 42,
+):
+    """Attach synthetic farms and hubs placed by official municipal data.
+
+    ``farms`` maps farm kinds to counts. Each farm's municipality is drawn
+    with probability proportional to its kind's weight there (``weights``,
+    default ``reference_farm_weights()``) and its point uniformly by area
+    inside that municipality. Every hub kind in ``fleets`` gets
+    ``hubs_per_fleet`` hubs, drawn the same way with the summed weights of
+    the placed farm kinds its fleets serve: an assumption, as there is no
+    open list of feed mills, slaughterhouses or egg-grading centres.
+    Placement follows ``_place_facilities``.
+
+    Raises ValueError before placing anything when a farm kind has no
+    weights, a fleet serves none of the placed kinds, or the world lacks a
+    municipality with positive weight: the data would not describe it.
+    """
+    weights = reference_farm_weights() if weights is None else weights
+    if hubs_per_fleet < 0 or any(count < 0 for count in farms.values()):
+        raise ValueError("Facility counts must be nonnegative")
+    unweighted = sorted(set(farms) - set(weights))
+    if unweighted:
+        raise ValueError(f"No municipal weights for farm kinds: {unweighted}")
+
+    served_by: dict[str, set[str]] = {}
+    for spec in fleets:
+        served = set(farms) if spec.client_kinds is None else set(spec.client_kinds)
+        served_by.setdefault(spec.hub_kind, set()).update(served & set(farms))
+    idle = sorted(hub_kind for hub_kind, served in served_by.items() if not served)
+    if idle:
+        raise ValueError(f"Fleets serve none of the placed farm kinds: {idle}")
+    site_weights: dict[str, dict[str, int]] = {
+        kind: {code: w for code, w in weights[kind].items() if w > 0}
+        for kind in farms
+    }
+    for hub_kind, served in sorted(served_by.items()):
+        summed: Counter[str] = Counter()
+        for kind in sorted(served):
+            summed.update(site_weights[kind])
+        site_weights[hub_kind] = dict(summed)
+    empty = sorted(kind for kind, sites in site_weights.items() if not sites)
+    if empty:
+        raise ValueError(f"No municipality has a positive weight for: {empty}")
+
+    admin = world.administrative
+    sp = admin.spatial
+    by_code = {m.code: m for m in admin.municipalities}
+    needed = set().union(*site_weights.values())
+    missing = sorted(needed - set(by_code))
+    if missing:
+        raise ValueError(
+            f"World lacks {len(missing)} municipalities of the reference data: "
+            f"{', '.join(missing[:5])}{', ...' if len(missing) > 5 else ''}"
+        )
+    metric = {
+        code: sp.geometry_to_metric(by_code[code].geometry_wgs84)
+        for code in sorted(needed)
+    }
+    rng = np.random.default_rng(seed)
+
+    def drawer(sites: Mapping[str, int]) -> PointDraw:
+        codes = sorted(sites)
+        cumulative = np.cumsum([sites[code] for code in codes])
+
+        def draw() -> tuple[Point, str] | None:
+            pick = rng.uniform(0.0, float(cumulative[-1]))
+            index = int(np.searchsorted(cumulative, pick, side="right"))
+            code = codes[min(index, len(codes) - 1)]
+            point = sample_point_in(metric[code], rng.uniform, attempts=1)
+            return None if point is None else (point, code)
+
+        return draw
+
+    wanted: list[tuple[str, str, PointDraw]] = []
+    for kind, count in sorted(farms.items()):
+        draw = drawer(site_weights[kind])
+        prefix = OFFICIAL_FARM_ID_PREFIXES.get(kind, f"{kind}-")
+        wanted += [(f"{prefix}{i + 1:04d}", kind, draw) for i in range(count)]
+    for hub_kind in sorted(served_by):
+        draw = drawer(site_weights[hub_kind])
+        wanted += [
+            (f"{hub_kind}-{i + 1:02d}", hub_kind, draw) for i in range(hubs_per_fleet)
+        ]
+    return _place_facilities(world, wanted)
+
+
+def _place_facilities(
+    world, wanted: Sequence[tuple[str, str, PointDraw]]
+) -> FacilityIndex:
+    """Place each wanted (id, kind, draw) in order; attach the index to the world.
+
+    A draw outside the state polygon is redrawn. With roads, so is one that
+    does not snap to a node of the largest strongly connected road component,
+    so all facilities can reach each other. After
+    ``PLACEMENT_ATTEMPTS_PER_FACILITY`` draws per wanted facility the rest
+    are left out with a warning.
+    """
+    admin = world.administrative
+    sp = admin.spatial
+    state_metric = sp.geometry_to_metric(admin.state_geometry_wgs84)
     connected = (
         world.roads.largest_component_nodes() if world.roads is not None else None
     )
 
     facilities: list[Facility] = []
     attempts = 0
-    max_attempts = len(wanted) * 200
+    max_attempts = len(wanted) * PLACEMENT_ATTEMPTS_PER_FACILITY
     while len(facilities) < len(wanted) and attempts < max_attempts:
         attempts += 1
-        facility_id, facility_kind, at_pole = wanted[len(facilities)]
-        if at_pole:
-            centre = centres[int(rng.integers(len(centres)))]
-            sigma = POLE_SIGMA_KM * 1000.0
-            mx, my = centre.x + rng.normal(0, sigma), centre.y + rng.normal(0, sigma)
-        else:
-            point = sample_point_in(state_metric, rng.uniform, attempts=1)
-            if point is None:
-                continue
-            mx, my = point.x, point.y
-        if not state_metric.contains(Point(mx, my)):
+        facility_id, facility_kind, draw = wanted[len(facilities)]
+        drawn = draw()
+        if drawn is None:
             continue
-        lon, lat = sp.unproject((mx, my))
-        fac = Facility(id=facility_id, kind=facility_kind, lon=lon, lat=lat)
+        point, code = drawn
+        if not state_metric.contains(point):
+            continue
+        lon, lat = sp.unproject((point.x, point.y))
+        fac = Facility(
+            id=facility_id,
+            kind=facility_kind,
+            lon=lon,
+            lat=lat,
+            municipality_code=code,
+        )
         if world.roads is not None:
             try:
                 fac = snap_facility(
@@ -828,7 +1742,7 @@ def install_synthetic_facilities(
         )
     if len(facilities) < len(wanted):
         missing = ", ".join(entry[0] for entry in wanted[len(facilities) :])
-        warnings.warn(f"Synthetic facilities not placed: {missing}", stacklevel=2)
+        warnings.warn(f"Synthetic facilities not placed: {missing}", stacklevel=3)
 
     world.facilities = FacilityIndex(facilities, metric_crs=world.config.metric_crs)
     return world.facilities

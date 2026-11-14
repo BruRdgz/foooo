@@ -1,85 +1,432 @@
 <!doctype html>
-<html lang="en">
+<html lang="pt-BR">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SimGeoPE · World inspector</title>
+  <meta name="color-scheme" content="light dark">
+  <title>SimGeoPE · Influenza aviária em Pernambuco</title>
   <link href="https://unpkg.com/maplibre-gl@5.6.2/dist/maplibre-gl.css" rel="stylesheet">
   <link href="/static/styles.css" rel="stylesheet">
   <script defer src="https://unpkg.com/maplibre-gl@5.6.2/dist/maplibre-gl.js"></script>
-  <script defer src="/static/app.js"></script>
+  <script type="module" src="/static/app.js"></script>
 </head>
-<body>
-  <main id="map" aria-label="Pernambuco world map"></main>
-  <aside>
-    <header><h1>SimGeoPE</h1><span>Static world inspector</span></header>
-    <fieldset id="toggles"><legend>Layers</legend>
-      <label><input type="checkbox" data-layer="admin" checked>Municipal boundaries</label>
-      <label><input type="checkbox" data-layer="roads" checked>Roads</label>
-      <label><input type="checkbox" data-layer="hydro" checked>Hydrology</label>
-      <label><input type="checkbox" data-layer="crossings" checked>Road / water crossings</label>
-      <label><input type="checkbox" data-layer="facilities" checked>Facilities</label>
-      <label><input type="checkbox" data-layer="environment">Environment: water distance</label>
-    </fieldset>
-    <fieldset id="sim" hidden><legend>Simulação H5N1</legend>
-      <div class="buttons">
-        <button id="sim-step">Passo</button>
-        <button id="sim-run">Rodar</button>
-        <button id="sim-reset">Configurar</button>
+<body data-current="sim">
+  <header class="topbar">
+    <div class="brand">
+      <h1>SimGeoPE</h1>
+      <p>Influenza aviária H5N1 em Pernambuco</p>
+    </div>
+    <nav class="modes" role="tablist" aria-label="Modo de trabalho" id="mode-tabs" hidden>
+      <button type="button" role="tab" id="tab-sim" data-target-mode="sim" aria-selected="true">Simulação</button>
+      <button type="button" role="tab" id="tab-world" data-target-mode="world" aria-selected="false">Inspeção do mundo</button>
+    </nav>
+    <button type="button" id="open-scenario" class="secondary" data-view="sim" hidden>Cenário e parâmetros</button>
+  </header>
+
+  <section class="kpis" id="kpis" data-view="sim" hidden aria-label="Indicadores do dia">
+    <div class="kpi" id="kpi-day"><span class="kpi-label">Dia</span><span class="kpi-value">—</span><span class="kpi-note"></span></div>
+    <div class="kpi" id="kpi-rt">
+      <span class="kpi-label">Rt</span>
+      <span class="kpi-value-row"><span class="kpi-value">—</span><span class="kpi-trend" role="img"></span></span>
+      <span class="kpi-note"></span>
+    </div>
+    <div class="kpi-group" role="group" aria-label="Granjas por situação">
+      <div class="kpi-farms">
+        <div class="kpi" id="kpi-healthy"><span class="kpi-label"><i class="mk mk-healthy"></i>Saudáveis</span><span class="kpi-value">—</span><span class="kpi-note"></span></div>
+        <div class="kpi" id="kpi-hidden"><span class="kpi-label"><i class="mk mk-hidden"></i>Ocultas</span><span class="kpi-value">—</span><span class="kpi-note"></span></div>
+        <div class="kpi" id="kpi-notified"><span class="kpi-label"><i class="mk mk-notified"></i>Notificadas</span><span class="kpi-value">—</span><span class="kpi-note"></span></div>
+        <div class="kpi" id="kpi-quarantined"><span class="kpi-label"><i class="mk mk-quarantined"></i>Em quarentena</span><span class="kpi-value">—</span><span class="kpi-note"></span></div>
+        <div class="kpi" id="kpi-culled"><span class="kpi-label"><i class="mk mk-culled"></i>Sacrificadas</span><span class="kpi-value">—</span><span class="kpi-note"></span></div>
+        <div class="kpi" id="kpi-restocked"><span class="kpi-label"><i class="mk mk-restocked"></i>Repovoadas</span><span class="kpi-value">—</span><span class="kpi-note"></span></div>
       </div>
-      <label for="sim-seed">Semente</label><input id="sim-seed" type="number" min="0" step="1">
-      <output id="sim-state">Carregando…</output>
-      <figure class="chart">
-        <figcaption>Granjas por situação</figcaption>
-        <div class="legend">
-          <span><i style="background:#2a78d6"></i>infectadas</span>
-          <span><i style="background:#eb6834"></i>em quarentena</span>
-          <span><i style="background:#1baf7a"></i>sacrificadas</span>
+      <div class="seg-bar" id="status-ribbon"></div>
+    </div>
+    <div class="kpi" id="kpi-protocol" hidden>
+      <span class="kpi-label"><i class="mk-focus"></i>Focos ativos</span><span class="kpi-value">—</span><span class="kpi-note"></span>
+    </div>
+    <div class="kpi" id="kpi-deaths"><span class="kpi-label">Aves mortas</span><span class="kpi-value">—</span><span class="kpi-note"></span></div>
+    <div class="kpi" id="kpi-cost"><span class="kpi-label">Custo acumulado</span><span class="kpi-value">—</span><span class="kpi-note"></span></div>
+    <div class="kpi" id="kpi-birds"><span class="kpi-label">Silvestres infectadas</span><span class="kpi-value">—</span><span class="kpi-note"></span></div>
+  </section>
+
+  <div class="workspace">
+    <!-- Simulation rail: playback, replay, layers -->
+    <aside class="rail" data-view="sim" hidden aria-label="Controles da simulação">
+      <section class="rail-section" aria-labelledby="playback-title">
+        <h2 id="playback-title">Reprodução</h2>
+        <p class="playback-now"><strong id="playback-day">Dia —</strong> <span id="playback-mode" data-state="live">ao vivo</span></p>
+        <p class="playback-date" id="playback-date"></p>
+        <div class="button-row">
+          <button type="button" id="sim-step" title="Atalho: seta para a direita">Passo</button>
+          <button type="button" id="sim-run" aria-pressed="false" title="Atalho: barra de espaço">Rodar</button>
         </div>
-        <svg id="chart-farms" role="img" aria-label="Granjas infectadas, em quarentena e sacrificadas por dia"></svg>
-        <output id="chart-farms-readout"></output>
-      </figure>
-      <figure class="chart">
-        <figcaption>Aves silvestres infectadas</figcaption>
-        <svg id="chart-birds" role="img" aria-label="Aves silvestres infectadas por dia"></svg>
-        <output id="chart-birds-readout"></output>
-      </figure>
-      <div class="legend">
-        <span><i style="background:#2e9e44"></i>saudável</span>
-        <span><i style="background:#e3c21b"></i>quarentena</span>
-        <span><i style="background:#ef8a17"></i>oculta</span>
-        <span><i style="background:#d62d20"></i>notificada</span>
-        <span><i style="background:#222"></i>sacrificada</span>
+        <fieldset class="segmented">
+          <legend>Dias por passo</legend>
+          <label><input type="radio" name="step-days" value="1" checked><span>1</span></label>
+          <label><input type="radio" name="step-days" value="7"><span>7</span></label>
+          <label><input type="radio" name="step-days" value="30"><span>30</span></label>
+        </fieldset>
+        <label class="field" for="sim-speed">Velocidade ao rodar
+          <select id="sim-speed">
+            <option value="slow">Lenta</option>
+            <option value="normal" selected>Normal</option>
+            <option value="fast">Rápida</option>
+          </select>
+        </label>
+        <label class="field" for="scrub">Rever um dia anterior</label>
+        <input type="range" id="scrub" min="0" max="0" step="1" value="0">
+        <div class="scrub-ends"><span id="scrub-first"></span><span id="scrub-last"></span></div>
+        <button type="button" id="go-live" class="secondary wide" hidden>Voltar ao vivo</button>
+        <p class="shortcut-hint">Atalhos: espaço roda ou pausa; seta para a direita avança.</p>
+      </section>
+
+      <section class="rail-section" aria-labelledby="layers-title">
+        <h2 id="layers-title">Camadas</h2>
+        <ul class="layers">
+          <li>
+            <label class="toggle"><input type="checkbox" data-layer="simFarms" checked>Granjas</label>
+            <ul class="legend">
+              <li><i class="mk mk-healthy"></i>Saudável</li>
+              <li><i class="mk mk-quarantined"></i>Em quarentena</li>
+              <li><i class="mk mk-hidden"></i>Infectada oculta</li>
+              <li><i class="mk mk-notified"></i>Notificada</li>
+              <li><i class="mk mk-culled"></i>Sacrificada</li>
+              <li><i class="mk mk-restocked"></i>Repovoada (parcial, em monitoramento)</li>
+              <li id="legend-focus" hidden><i class="mk-focus"></i>Foco confirmado</li>
+            </ul>
+            <ul class="legend">
+              <li><i class="mk-type"></i>Corte</li>
+              <li><i class="mk-type postura"></i>Postura (centro vazado)</li>
+            </ul>
+            <fieldset class="segmented small">
+              <legend>Mostrar granjas</legend>
+              <label><input type="radio" name="farm-type" value="" checked><span>Todas</span></label>
+              <label><input type="radio" name="farm-type" value="postura"><span>Postura</span></label>
+              <label><input type="radio" name="farm-type" value="corte"><span>Corte</span></label>
+            </fieldset>
+          </li>
+          <li id="zones-layer" hidden>
+            <label class="toggle"><input type="checkbox" data-layer="simZones" checked>Zonas de emergência</label>
+            <ul class="legend" id="legend-zones">
+              <li><i class="key key-ring perifoco"></i><span data-ring="perifoco">Perifoco</span></li>
+              <li><i class="key key-ring vigilancia"></i><span data-ring="vigilancia">Vigilância</span></li>
+              <li><i class="key key-ring protecao"></i><span data-ring="protecao">Proteção</span></li>
+              <li><i class="key key-standstill"></i>Trânsito interrompido</li>
+            </ul>
+            <p class="legend-note" id="zones-note">Raios em linha reta a partir de cada foco.</p>
+          </li>
+          <li>
+            <label class="toggle"><input type="checkbox" data-layer="simHubs" checked>Bases (fábricas, abatedouros, entrepostos)</label>
+            <p class="legend-note">Tamanho e cor pela carga de fômite. Clique numa base para ver os lotes recebidos.</p>
+            <div class="ramp-legend"><i class="mk-hub"></i><div class="ramp-block"><span class="ramp fomite"></span><span class="ramp-ends"><span>0%</span><span>100%</span></span></div></div>
+          </li>
+          <li>
+            <label class="toggle"><input type="checkbox" data-layer="simTrucks" checked>Rotas dos caminhões no dia</label>
+            <p class="legend-note">Cor pela carga ao chegar</p>
+            <div class="ramp-legend"><div class="ramp-block"><span class="ramp fomite line"></span><span class="ramp-ends"><span>0%</span><span>100%</span></span></div></div>
+            <ul class="legend"><li><i class="key key-intro"></i>Viagem que introduziu infecção</li></ul>
+          </li>
+          <li>
+            <label class="toggle"><input type="checkbox" data-layer="simChain">Cadeia de transmissão</label>
+            <fieldset class="segmented small">
+              <legend>Introduções dos últimos dias até o dia exibido</legend>
+              <label><input type="radio" name="chain-window" value="1"><span>1</span></label>
+              <label><input type="radio" name="chain-window" value="7" checked><span>7</span></label>
+              <label><input type="radio" name="chain-window" value="30"><span>30</span></label>
+              <label><input type="radio" name="chain-window" value="0"><span>Todos</span></label>
+            </fieldset>
+            <ul class="legend">
+              <li><i class="key key-line" style="--c: var(--pw-fomite)"></i>Caminhão (origem, base, destino)</li>
+              <li><i class="key key-dash" style="--c: var(--pw-local)"></i>Vizinhança, origem provável</li>
+              <li><i class="key key-line" style="--c: var(--pw-birds)"></i>Aves silvestres</li>
+              <li><i class="key key-seed"></i>Sem trajeto: inicial, reinfecção ou ave sem posição</li>
+              <li><i class="key key-hubring"></i>Base que repassou fômite</li>
+            </ul>
+            <p class="legend-note">Setas no sentido da transmissão; linha mais fina, menor parcela do risco atribuída à origem. Clique numa linha para detalhes.</p>
+          </li>
+          <li>
+            <label class="toggle"><input type="checkbox" data-layer="simBirds" checked>Aves silvestres</label>
+            <ul class="legend">
+              <li><i class="dot" style="--c: var(--bird-s)"></i>Suscetível</li>
+              <li><i class="dot" style="--c: var(--pw-birds)"></i>Infectada</li>
+              <li><i class="dot" style="--c: var(--bird-r)"></i>Recuperada</li>
+            </ul>
+          </li>
+          <li>
+            <label class="toggle"><input type="checkbox" data-layer="simFlocks" checked>Chegadas de bandos migratórios</label>
+            <ul class="legend">
+              <li><i class="ring" style="--c: var(--pw-birds)"></i>Bando com ave infectada</li>
+              <li><i class="ring thin" style="--c: var(--bird-s)"></i>Bando sem infecção</li>
+              <li><i class="ring thin site" style="--c: var(--bird-s)"></i>Pousou num sítio conhecido</li>
+            </ul>
+            <p class="legend-note">Últimos 7 dias até o dia exibido. Tamanho pelo número de aves; mais apagado, chegada mais antiga. Clique num bando para detalhes.</p>
+            <figure class="month-profile" id="arrival-profile" hidden>
+              <figcaption class="legend-note">Chegadas por mês, em relação ao mês de pico; destacado o mês do dia exibido.</figcaption>
+              <div class="month-bars" id="arrival-profile-bars"></div>
+            </figure>
+          </li>
+          <li>
+            <label class="toggle"><input type="checkbox" data-layer="simHeat">Zona de calor</label>
+            <label class="field" for="heat-weight">Peso de cada granja
+              <select id="heat-weight">
+                <option value="introductions" selected>Introduções de infecção</option>
+                <option value="infected_days">Dias infectada</option>
+                <option value="exposed">Aves expostas</option>
+              </select>
+            </label>
+            <label class="field" for="heat-window">Período
+              <select id="heat-window">
+                <option value="all" selected>Todo o período</option>
+                <option value="recent">Últimos 30 dias até o dia exibido</option>
+                <option value="until">Do início até o dia exibido</option>
+              </select>
+            </label>
+            <div class="ramp-legend"><div class="ramp-block"><span class="ramp heat"></span><span class="ramp-ends"><span>Baixo</span><span>Alto</span></span></div></div>
+            <p class="legend-note" id="heat-scale">Intensidade relativa à granja com o maior valor.</p>
+          </li>
+          <li>
+            <label class="toggle"><input type="checkbox" data-layer="simRisk" checked>Risco de infecção</label>
+            <p class="replay-note" id="risk-replay-note" hidden>Só existe para o dia atual: oculto durante o replay.</p>
+            <fieldset class="segmented small">
+              <legend>Colorir por</legend>
+              <label><input type="radio" name="risk-mode" value="total" checked><span>Nível total</span></label>
+              <label><input type="radio" name="risk-mode" value="dominant"><span>Via dominante</span></label>
+            </fieldset>
+            <ul class="legend" id="legend-risk-total">
+              <li><i class="box" style="--c: var(--risk-1)"></i>Baixo</li>
+              <li><i class="box" style="--c: var(--risk-2)"></i>Médio</li>
+              <li><i class="box" style="--c: var(--risk-3)"></i>Alto</li>
+            </ul>
+            <ul class="legend" id="legend-risk-dominant" hidden>
+              <li><i class="box" style="--c: var(--pw-birds)"></i>Aves silvestres</li>
+              <li><i class="box" style="--c: var(--pw-fomite)"></i>Caminhão</li>
+              <li><i class="box" style="--c: var(--pw-local)"></i>Vizinhança</li>
+              <li class="legend-note">Opacidade indica o nível</li>
+            </ul>
+          </li>
+          <li>
+            <label class="toggle"><input type="checkbox" data-layer="simInterventions" checked>Raio de sacrifício sanitário</label>
+            <ul class="legend"><li><i class="key key-zone"></i>Zona em volta de granja sacrificada</li></ul>
+          </li>
+          <li>
+            <label class="toggle"><input type="checkbox" data-layer="simAdmin" checked>Limites municipais</label>
+          </li>
+        </ul>
+      </section>
+      <section class="rail-section">
+        <h2>Este cenário</h2>
+        <ul class="plain notes" id="sim-notes"></ul>
+      </section>
+    </aside>
+
+    <!-- World inspection rail -->
+    <aside class="rail" data-view="world" hidden aria-label="Controles da inspeção do mundo">
+      <section class="rail-section" aria-labelledby="world-layers-title">
+        <h2 id="world-layers-title">Camadas do mundo</h2>
+        <ul class="layers">
+          <li><label class="toggle"><input type="checkbox" data-layer="admin" checked>Limites municipais</label>
+            <ul class="legend"><li><i class="key key-line" style="--c: var(--world-admin)"></i>Município</li></ul></li>
+          <li><label class="toggle"><input type="checkbox" data-layer="roads" checked>Estradas</label>
+            <ul class="legend"><li><i class="key key-line" style="--c: var(--world-road)"></i>Trecho de estrada</li></ul></li>
+          <li><label class="toggle"><input type="checkbox" data-layer="hydro" checked>Hidrografia</label>
+            <ul class="legend"><li><i class="key key-line" style="--c: var(--world-hydro)"></i>Rio ou corpo d’água</li></ul></li>
+          <li><label class="toggle"><input type="checkbox" data-layer="crossings" checked>Cruzamentos estrada/água</label>
+            <ul class="legend"><li><i class="dot" style="--c: var(--world-crossing)"></i>Ponte ou travessia</li></ul></li>
+          <li><label class="toggle"><input type="checkbox" data-layer="facilities" checked>Instalações</label>
+            <ul class="legend"><li><i class="dot" style="--c: var(--world-facility)"></i>Granja, fábrica ou abatedouro</li></ul></li>
+          <li><label class="toggle"><input type="checkbox" data-layer="environment">Ambiente: distância à água</label>
+            <div class="ramp-legend"><div class="ramp-block"><span class="ramp water"></span><span class="ramp-ends"><span>0 km</span><span>20 km ou mais</span></span></div></div></li>
+        </ul>
+      </section>
+      <section class="rail-section" aria-labelledby="route-title">
+        <h2 id="route-title">Depurar rota</h2>
+        <p class="legend-note">Escolha A e B e clique em dois pontos ou instalações.</p>
+        <div class="button-row">
+          <button type="button" id="choose-route" aria-pressed="false">Escolher A e B</button>
+          <button type="button" id="clear-route" class="secondary">Limpar</button>
+        </div>
+        <output id="endpoints">Nenhuma rota selecionada.</output>
+        <label class="field" for="closed">Arestas fechadas (IDs separados por vírgula)</label>
+        <input id="closed" placeholder="123, 456" inputmode="numeric">
+        <label class="field" for="costs">Multiplicadores de custo (JSON: aresta → fator)</label>
+        <textarea id="costs" rows="2" placeholder='{"123": 2}'></textarea>
+        <button type="button" id="requery" class="wide">Recalcular rota</button>
+        <output id="route-metrics"></output>
+        <p class="legend-note">Fechamentos e custos valem só para a consulta, não alteram o mundo.</p>
+      </section>
+    </aside>
+
+    <main class="mapwrap">
+      <div id="map" role="region" aria-label="Mapa de Pernambuco"></div>
+      <article class="farm-card" id="farm-card" data-view="sim" hidden aria-labelledby="farm-card-title">
+        <header>
+          <div>
+            <h2 id="farm-card-title">Granja</h2>
+            <p id="farm-card-sub"></p>
+          </div>
+          <button type="button" id="farm-card-close" class="icon" aria-label="Fechar ficha da granja">×</button>
+        </header>
+        <div id="farm-card-body"></div>
+      </article>
+    </main>
+
+    <!-- Simulation panel: charts + timeline -->
+    <aside class="panel" data-view="sim" hidden aria-label="Gráficos e eventos">
+      <section class="charts" aria-labelledby="charts-title">
+        <div class="panel-head">
+          <h2 id="charts-title">Evolução do surto</h2>
+          <p class="legend-note">Clique num gráfico para rever aquele dia no mapa.</p>
+        </div>
+        <figure class="chart">
+          <figcaption>
+            <div class="chart-title-row">
+              <h3>Granjas por situação</h3>
+              <div class="mini-toggle" role="group" aria-label="Escala do gráfico">
+                <button type="button" data-chart-scope="all" aria-pressed="true">Todas</button>
+                <button type="button" data-chart-scope="affected" aria-pressed="false">Só afetadas</button>
+              </div>
+            </div>
+            <ul class="legend">
+              <li><i class="key key-box" style="--c: var(--st-healthy)"></i>Saudáveis</li>
+              <li><i class="key key-box" style="--c: var(--st-quarantined)"></i>Em quarentena</li>
+              <li><i class="key key-box" style="--c: var(--st-hidden)"></i>Ocultas</li>
+              <li><i class="key key-box" style="--c: var(--st-notified)"></i>Notificadas</li>
+              <li><i class="key key-box" style="--c: var(--st-culled)"></i>Sacrificadas</li>
+              <li><i class="key key-box" style="--c: var(--st-restocked)"></i>Repovoadas</li>
+            </ul>
+          </figcaption>
+          <svg id="chart-status" role="img" aria-label="Granjas por situação"></svg>
+          <output class="readout" id="readout-status"></output>
+        </figure>
+        <figure class="chart">
+          <figcaption>
+            <h3>Número reprodutivo (Rt)</h3>
+            <ul class="legend">
+              <li><i class="key key-line faint" style="--c: var(--series-neutral)"></i>Rt do dia</li>
+              <li><i class="key key-line" style="--c: var(--series-neutral)"></i>Média móvel 7 dias</li>
+            </ul>
+          </figcaption>
+          <svg id="chart-rt" role="img" aria-label="Número reprodutivo Rt"></svg>
+          <output class="readout" id="readout-rt"></output>
+        </figure>
+        <figure class="chart">
+          <figcaption><h3>Aves expostas por dia</h3></figcaption>
+          <svg id="chart-incidence" role="img" aria-label="Incidência diária"></svg>
+          <output class="readout" id="readout-incidence"></output>
+        </figure>
+        <figure class="chart">
+          <figcaption>
+            <h3>Introduções em granjas por via</h3>
+            <ul class="legend">
+              <li><i class="key key-box" style="--c: var(--pw-fomite)"></i>Caminhão (fômite)</li>
+              <li><i class="key key-box" style="--c: var(--pw-local)"></i>Vizinhança</li>
+              <li><i class="key key-box" style="--c: var(--pw-birds)"></i>Aves silvestres</li>
+            </ul>
+          </figcaption>
+          <svg id="chart-intro" role="img" aria-label="Introduções por via"></svg>
+          <output class="readout" id="readout-intro"></output>
+        </figure>
+        <figure class="chart">
+          <figcaption>
+            <h3>Bases na cadeia</h3>
+            <p class="legend-note" id="hub-chain-note"></p>
+          </figcaption>
+          <ol class="rank-bars" id="hub-chain-bars" aria-label="Introduções por caminhão por base"></ol>
+        </figure>
+        <figure class="chart markets" aria-labelledby="markets-title">
+          <figcaption>
+            <h3 id="markets-title">Produção e mercados</h3>
+            <p class="legend-note" id="markets-note"></p>
+          </figcaption>
+          <div class="table-scroll" id="markets-table"></div>
+          <p class="legend-note">O modelo mede quanto produto saiu de granjas infectadas e quanto foi recolhido; não estima infecção de pessoas pelo consumo.</p>
+        </figure>
+        <figure class="chart">
+          <figcaption>
+            <h3>Lotes expostos e recolhidos (acumulado)</h3>
+            <ul class="legend">
+              <li><i class="key key-line" style="--c: var(--st-hidden)"></i>Expostos</li>
+              <li><i class="key key-line" style="--c: var(--series-neutral)"></i>Expostos recolhidos</li>
+            </ul>
+          </figcaption>
+          <svg id="chart-lots" role="img" aria-label="Lotes expostos e recolhidos"></svg>
+          <output class="readout" id="readout-lots"></output>
+        </figure>
+        <details class="chart markets-hubs" id="markets-hubs">
+          <summary>Lotes expostos por entreposto e abatedouro</summary>
+          <p class="legend-note" id="markets-hubs-note"></p>
+          <ol class="rank-bars" id="markets-hubs-bars" aria-label="Lotes expostos por base de destino"></ol>
+        </details>
+        <figure class="chart">
+          <figcaption><h3>Custo acumulado</h3></figcaption>
+          <svg id="chart-cost" role="img" aria-label="Custo acumulado"></svg>
+          <output class="readout" id="readout-cost"></output>
+        </figure>
+        <figure class="chart">
+          <figcaption><h3>Aves silvestres infectadas</h3></figcaption>
+          <svg id="chart-birds" role="img" aria-label="Aves silvestres infectadas"></svg>
+          <output class="readout" id="readout-birds"></output>
+        </figure>
+        <details id="data-table" class="data-table">
+          <summary>Ver dados em tabela (últimos 30 dias)</summary>
+          <div class="table-scroll" id="data-table-body"></div>
+        </details>
+      </section>
+      <section class="timeline" aria-labelledby="events-title">
+        <div class="panel-head"><h2 id="events-title">Eventos</h2></div>
+        <div class="chips" id="event-filters" role="group" aria-label="Filtrar eventos por categoria"></div>
+        <div id="event-notes" class="legend-note"></div>
+        <ol class="event-days" id="events"></ol>
+      </section>
+    </aside>
+
+    <!-- World panel: inspection + metadata -->
+    <aside class="panel" data-view="world" hidden aria-label="Inspeção e metadados">
+      <section aria-labelledby="inspection-title">
+        <div class="panel-head"><h2 id="inspection-title">Inspeção</h2></div>
+        <div id="inspection"><p class="muted">Clique numa feição ou em qualquer ponto do mapa.</p></div>
+      </section>
+      <details class="metadata">
+        <summary>Metadados e limitações do mundo</summary>
+        <div id="metadata"></div>
+      </details>
+    </aside>
+  </div>
+
+  <footer class="statusbar" id="statusbar" data-kind="busy">
+    <span class="status-dot" aria-hidden="true"></span>
+    <span id="status-text" role="status">Carregando o mundo…</span>
+    <span class="status-credit">Mapa: MapLibre e OpenStreetMap; precisa de internet no navegador.</span>
+  </footer>
+
+  <dialog id="scenario" aria-labelledby="scenario-title">
+    <form id="scenario-form" novalidate>
+      <header class="dialog-head">
+        <div>
+          <h2 id="scenario-title">Cenário e parâmetros</h2>
+          <p id="scenario-modified" class="legend-note"></p>
+        </div>
+        <button type="button" id="scenario-cancel" class="icon" aria-label="Fechar sem aplicar">×</button>
+      </header>
+      <p class="dialog-error" id="scenario-error" role="alert" hidden></p>
+      <div class="dialog-body">
+        <div class="preset" id="scenario-preset-row" hidden>
+          <label class="field" for="scenario-preset">Cenário pronto
+            <select id="scenario-preset"></select>
+          </label>
+          <p class="legend-note" id="scenario-preset-note"></p>
+          <p class="legend-note">Cenários prontos ilustram comportamentos do modelo; não são calibrados com dados reais.</p>
+        </div>
+        <label class="field seed" for="scenario-seed">Semente aleatória
+          <input type="number" id="scenario-seed" min="0" step="1" required>
+        </label>
+        <div id="scenario-fields"></div>
       </div>
-      <label><input type="checkbox" data-layer="simFarms" checked>Granjas</label>
-      <label><input type="checkbox" data-layer="simHubs" checked>Bases (fábricas, abatedouros)</label>
-      <label><input type="checkbox" data-layer="simTrucks" checked>Rotas dos caminhões (hoje)</label>
-      <label><input type="checkbox" data-layer="simBirds" checked>Aves silvestres (azul suscetível · rosa infectada · cinza recuperada)</label>
-      <label><input type="checkbox" data-layer="simRisk" checked>Risco de infecção</label>
-      <label><input type="checkbox" data-layer="simInterventions" checked>Raio de sacrifício sanitário</label>
-      <label for="sim-action">Intervenção na granja selecionada</label>
-      <select id="sim-action">
-        <option value="stamping_out">Sacrifício sanitário</option>
-        <option value="movement_block">Bloqueio de movimentação</option>
-        <option value="biosecurity_boost">Melhoria de biosseguridade</option>
-      </select>
-      <output id="sim-selected">Clique numa granja para selecioná-la.</output>
-      <button id="sim-intervene" disabled>Aplicar intervenção</button>
-      <details open><summary>Log da simulação</summary><pre id="sim-log"></pre></details>
-    </fieldset>
-    <fieldset><legend>Route debug</legend>
-      <p>Choose A/B, then click two points or facilities.</p>
-      <div class="buttons"><button id="choose-route">Choose A / B</button><button id="clear-route">Clear</button></div>
-      <output id="endpoints">No route selected.</output>
-      <label for="closed">Closed edge IDs (comma separated)</label><input id="closed" placeholder="123, 456">
-      <label for="costs">Cost multipliers (JSON edge ID → factor)</label><textarea id="costs" rows="2" placeholder='{"123": 2}'></textarea>
-      <button id="requery">Recalculate route</button>
-      <output id="route-metrics"></output>
-    </fieldset>
-    <p id="status" role="status">Loading world…</p>
-    <details open><summary>Inspection</summary><pre id="inspection">Click a feature or any point.</pre></details>
-    <details><summary>World metadata / limitations</summary><pre id="metadata"></pre></details>
-    <footer>Layers query the loaded world. Debug costs are temporary.<br>MapLibre CDN and OSM basemap require internet.</footer>
-  </aside>
+      <footer class="dialog-foot">
+        <button type="button" id="scenario-defaults" class="secondary">Restaurar padrões</button>
+        <button type="submit" id="scenario-apply">Aplicar e reiniciar</button>
+      </footer>
+    </form>
+  </dialog>
 </body>
 </html>

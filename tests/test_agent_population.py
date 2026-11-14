@@ -16,7 +16,7 @@ from simgeope.simulation import (
     ModelParams,
     TruckAgent,
 )
-from simgeope.simulation.agents import decayed_fomite_load
+from simgeope.simulation.agents import Lot, decayed_fomite_load
 from simgeope.world.exceptions import NoRoadNearbyError
 from simgeope.world.facilities import Facility
 
@@ -285,3 +285,528 @@ def test_fleet_setup_assigns_nearest_hub_and_reports_unreachable_farms(
     assert truck.base is east
     assert [farm.farm_id for farm in truck.clients] == ["f1"]
     assert west.hub_id not in {t.base.hub_id for t in model.trucks}
+
+
+@pytest.mark.parametrize(
+    "client_kinds,expected",
+    [
+        (None, ["f1", "f2", "f3"]),
+        (("farm_layer",), ["f1"]),
+        (("farm_layer", "farm"), ["f1", "f3"]),
+        (("market",), []),
+    ],
+)
+def test_fleet_serves_only_its_client_kinds(two_way_world, client_kinds, expected):
+    model = AgentModel(
+        two_way_world,
+        params=ModelParams(fleets=(FleetSpec("egg_grading", 1, 3, client_kinds),)),
+    )
+    model.add_hub(Facility("hub", "egg_grading", -35.0, -8.0))
+    for farm_id, kind, lon in (
+        ("f1", "farm_layer", -34.99),
+        ("f2", "farm_broiler", -34.98),
+        ("f3", "farm", -34.98),
+    ):
+        model.add_farm(Facility(farm_id, kind, lon, -8.0))
+
+    model.setup_fleets()
+
+    served = [farm.farm_id for truck in model.trucks for farm in truck.clients]
+    assert sorted(served) == expected
+    assert [f.production for f in model.farms] == ["postura", "corte", None]
+
+
+@pytest.mark.parametrize(
+    "start_month,day,expected", [(1, 0, "2025-01-01"), (8, 31, "2025-09-01")]
+)
+def test_current_date_starts_on_first_of_start_month(
+    tiny_world, start_month, day, expected
+):
+    model = AgentModel(tiny_world, params=ModelParams(start_month=start_month))
+    model.day_count = day
+    assert model.current_date.isoformat() == expected
+
+
+def _provenance_model(world, routes, *, max_stops=1, **params):
+    """A mill at node 10; infected f1 (node 20) and healthy f2 (node 30).
+
+    `routes` maps truck IDs to client lists, created in that order.
+    """
+    model = AgentModel(
+        world,
+        params=ModelParams(
+            truck_shift_hours=1,
+            truck_service_minutes=0,
+            infection_prob_truck_to_farm=100.0,
+            hub_transfer_fraction=1.0,
+            base_biosecurity=0.0,
+            **params,
+        ),
+        seed=1,
+    )
+    mill = model.add_hub(Facility("mill", "feed_mill", -35.0, -8.0))
+    farms = {
+        farm_id: model.add_farm(Facility(farm_id, "farm", lon, -8.0), pop_total=100)
+        for farm_id, lon in (("f1", -34.99), ("f2", -34.98))
+    }
+    farms["f1"].susceptible, farms["f1"].infected = 0.0, 100.0
+    for truck_id, clients in routes.items():
+        model.add_truck(
+            truck_id, mill, [farms[c] for c in clients], max_stops_per_day=max_stops
+        )
+    return model
+
+
+# A decayed load makes a visit's introduction likely but not certain.
+MAX_PROVENANCE_DAYS = 10
+
+
+@pytest.mark.parametrize(
+    "routes,max_stops,expected",
+    [
+        # One truck carries f1's load straight to f2 on the same tour.
+        ({"t1": ["f1", "f2"]}, 2, ("f1", None, "t1")),
+        # t1 leaves f1's load at the mill, where t2 picks it up for f2.
+        ({"t1": ["f1"], "t2": ["f2"]}, 1, ("f1", "mill", "t2")),
+    ],
+)
+def test_fomite_introduction_records_source_farm_relaying_hub_and_truck(
+    two_way_world, routes, max_stops, expected
+):
+    model = _provenance_model(
+        two_way_world, routes, max_stops=max_stops, truck_disinfection_prob=0.0
+    )
+    for _ in range(MAX_PROVENANCE_DAYS):
+        for truck in model.trucks:
+            truck.step()
+        if model.transmissions:
+            break
+
+    (transmission,) = model.transmissions
+    assert (
+        transmission.farm_id,
+        transmission.pathway,
+        transmission.source_farm_id,
+        transmission.hub_id,
+        transmission.truck_id,
+        transmission.bird_id,
+        transmission.share,
+    ) == ("f2", "fomite", *expected, None, 1.0)
+
+
+def test_disinfection_and_full_decay_clear_load_sources(two_way_world):
+    model = _provenance_model(
+        two_way_world,
+        {"t1": ["f1"]},
+        truck_disinfection_prob=1.0,
+        fomite_survival_days=1,
+    )
+    (truck,) = model.trucks
+    mill = truck.base
+
+    truck.step()
+    assert (truck.load, truck.load_source) == (0.0, None)
+    assert (mill.load, mill.load_source) == (1.0, ("f1", None))
+
+    model.farm_by_id("f1").infected = 0.0  # stops shedding: nothing reloads
+    model.step()  # decays to the negligible level, keeping its source
+    assert mill.load > 0 and mill.load_source == ("f1", None)
+    model.step()
+    assert (mill.load, mill.load_source) == (0.0, None)
+
+
+def test_equal_load_keeps_the_existing_source(two_way_world):
+    model = _provenance_model(
+        two_way_world, {"t1": ["f1", "f2"]}, max_stops=2, truck_disinfection_prob=0.0
+    )
+    f2 = model.farm_by_id("f2")
+    f2.susceptible, f2.infected = 0.0, 100.0  # sheds as fully as f1
+    (truck,) = model.trucks
+
+    truck.step()
+
+    assert truck.load == truck.base.load == 1.0
+    assert truck.load_source == truck.base.load_source == ("f1", None)
+
+
+def _zoned_route(world, *, hub_kind="feed_mill", zones=(None, None, None), **params):
+    """A hub at node 10 whose truck visits f1 (node 20) then f2 (node 30).
+
+    `zones` sets the (hub, f1, f2) protocol rings directly, as the model
+    would at the end of the previous day; f1 is shedding fully.
+    """
+    model = AgentModel(
+        world,
+        params=ModelParams(
+            truck_shift_hours=1,
+            truck_service_minutes=0,
+            truck_disinfection_prob=0.0,
+            infection_prob_truck_to_farm=0.0,
+            hub_transfer_fraction=1.0,
+            **params,
+        ),
+        seed=1,
+    )
+    hub = model.add_hub(Facility("hub", hub_kind, -35.0, -8.0))
+    f1 = model.add_farm(Facility("f1", "farm", -34.99, -8.0), pop_total=100)
+    f2 = model.add_farm(Facility("f2", "farm", -34.98, -8.0), pop_total=100)
+    f1.susceptible, f1.infected = 0.0, 100.0
+    hub.zone, f1.zone, f2.zone = zones
+    truck = model.add_truck("t", hub, [f1, f2], max_stops_per_day=2)
+    return model, truck
+
+
+def _tour(model, truck):
+    start = len(model.movements)
+    truck.step()
+    return [m.destination_id for m in model.movements[start:]]
+
+
+@pytest.mark.parametrize(
+    "protocol,zones,prob,load_at_f2",
+    [
+        (1, ("vigilancia",) * 3, 1.0, 0.0),  # disinfected on leaving f1
+        (1, ("vigilancia",) * 3, 0.0, 1.0),
+        (1, ("perifoco",) * 3, 1.0, 0.0),
+        (1, ("protecao",) * 3, 1.0, 1.0),  # no per-stop rule in proteção
+        (1, (None, None, "protecao"), 1.0, 0.0),  # crossing into the area
+        (0, ("vigilancia",) * 3, 1.0, 1.0),  # protocol off: zones ignored
+    ],
+)
+def test_zone_disinfection_clears_load_and_source(
+    two_way_world, protocol, zones, prob, load_at_f2
+):
+    model, truck = _zoned_route(
+        two_way_world,
+        zones=zones,
+        protocol_enabled=protocol,
+        zone_disinfection_prob=prob,
+    )
+    assert _tour(model, truck) == ["f1", "f2", "hub"]
+    arrivals = {m.destination_id: m for m in model.movements}
+    assert arrivals["f2"].load_on_arrival == load_at_f2
+    assert truck.base.load == load_at_f2  # deposited on return
+    assert (truck.load_source is None) is (load_at_f2 == 0.0)
+
+
+@pytest.mark.parametrize(
+    "protocol,hub_kind,ring,notified,tour",
+    [
+        (1, "slaughterhouse", "perifoco", True, ["f2", "hub"]),  # fails exam
+        (1, "slaughterhouse", "perifoco", False, ["f1", "f2", "hub"]),  # hidden
+        (1, "slaughterhouse", "vigilancia", True, ["f1", "f2", "hub"]),
+        (1, "feed_mill", "perifoco", True, ["f1", "f2", "hub"]),  # feed continues
+        (0, "slaughterhouse", "perifoco", True, ["f1", "f2", "hub"]),
+    ],
+)
+def test_slaughter_trucks_skip_notified_perifoco_farms_only(
+    two_way_world, protocol, hub_kind, ring, notified, tour
+):
+    model, truck = _zoned_route(
+        two_way_world,
+        hub_kind=hub_kind,
+        zones=(None, ring, ring),
+        protocol_enabled=protocol,
+        zone_disinfection_prob=0.0,
+    )
+    f1 = model.farm_by_id("f1")
+    f1.notified = notified  # not quarantined yet: still within the reaction time
+    assert _tour(model, truck) == tour
+
+
+@pytest.mark.parametrize(
+    "protocol,zones,tours",
+    [
+        # After stopping inside, the outside f2 waits for tomorrow's tour.
+        (1, (None, "protecao", None), [["f1", "hub"], ["f2", "f1", "hub"]]),
+        (1, (None, None, "protecao"), [["f1", "f2", "hub"]] * 2),
+        (0, (None, "protecao", None), [["f1", "f2", "hub"]] * 2),
+    ],
+)
+def test_truck_stopping_inside_area_skips_later_outside_stops(
+    two_way_world, protocol, zones, tours
+):
+    model, truck = _zoned_route(two_way_world, zones=zones, protocol_enabled=protocol)
+    assert [_tour(model, truck) for _ in tours] == tours
+
+
+def test_standstill_blocks_stops_inside_protection_radius_then_lifts(
+    two_way_world,
+):
+    model, _ = _zoned_route(
+        two_way_world,
+        protocol_enabled=1,
+        perifocus_radius_km=0.3,
+        surveillance_radius_km=0.6,
+        protection_radius_km=1.3,
+        confirmation_days=0,
+        standstill_days=2,
+        local_spread_prob=0.0,
+        infection_prob_bird_to_farm=0.0,
+        migratory_flocks_per_day=0.0,
+    )
+    model.farm_by_id("f1").infected = 0.0  # no fomite in this test
+    # Focus 1.1 km from f2 and 1.56 km from f1: only f2 is in its area.
+    focus = model.add_farm(Facility("x", "farm", -34.98, -8.01), pop_total=1000)
+    focus.susceptible, focus.exposed = 900.0, 100.0
+    focus.first_infection_day, focus.detection_day = 0, 1
+
+    tours = []
+    for _ in range(4):
+        start = len(model.movements)
+        model.step()
+        tours.append([m.destination_id for m in model.movements[start:]])
+
+    # Confirmed at the end of day 1: no stop at f2 on days 2 and 3.
+    assert tours == [
+        ["f1", "f2", "hub"],
+        ["f1", "hub"],
+        ["f1", "hub"],
+        ["f1", "f2", "hub"],
+    ]
+    assert model.farm_by_id("f2").zone == "protecao"
+    assert [e.day for e in model.events if e.kind == "INTERDICAO_TRANSITO"] == [1]
+
+
+# ------------------------------------------------------ product lots
+def _lot_model(world, hub_kind, farms, *, max_stops=1, **params):
+    """One `hub_kind` hub at node 10 and one truck serving `farms` in order.
+
+    `farms` maps farm IDs to longitudes on the 10-20-30 corridor; each layer
+    farm has 1200 birds, and nothing but the truck changes them.
+    """
+    model = AgentModel(
+        world,
+        params=ModelParams(truck_shift_hours=1, truck_service_minutes=0, **params),
+        seed=1,
+    )
+    hub = model.add_hub(Facility("hub", hub_kind, -35.0, -8.0))
+    clients = [
+        model.add_farm(Facility(farm_id, "farm_layer", lon, -8.0), pop_total=1200)
+        for farm_id, lon in farms.items()
+    ]
+    truck = model.add_truck("t", hub, clients, max_stops_per_day=max_stops)
+    return model, truck
+
+
+def _collect_on(model, truck, day):
+    model.day_count = day
+    truck.step()
+
+
+def test_egg_lots_carry_what_was_laid_since_the_last_collection(two_way_world):
+    model, truck = _lot_model(
+        two_way_world, "egg_grading", {"f1": -34.99, "f2": -34.98}
+    )
+    # One stop per day: each farm is collected every other day.
+    for day in (1, 2, 3):
+        _collect_on(model, truck, day)
+    # 1200 hens x 0.8 eggs/day = 80 dozen per day since the last collection.
+    assert [(lot.day, lot.farm_id, lot.quantity) for lot in model.lots] == [
+        (1, "f1", pytest.approx(80.0)),
+        (2, "f2", pytest.approx(160.0)),
+        (3, "f1", pytest.approx(160.0)),
+    ]
+    assert {(lot.product, lot.hub_id, lot.truck_id) for lot in model.lots} == {
+        ("ovos", "hub", "t")
+    }
+
+
+@pytest.mark.parametrize(
+    "between,status,days",
+    [
+        (None, "healthy", 4),
+        # The infection ended undetected before the visit: still exposed.
+        ("hidden", "hidden", 4),
+        ("notified", "notified", 4),
+        # Assumption: eggs held under quarantine are destroyed on the farm.
+        ("quarantine", "healthy", 1),
+    ],
+)
+def test_egg_lot_status_covers_every_day_since_the_last_collection(
+    two_way_world, between, status, days
+):
+    model, truck = _lot_model(
+        two_way_world, "egg_grading", {"f1": -34.99}, quarantine_release_days=0
+    )
+    (farm,) = model.farms
+    _collect_on(model, truck, 1)
+    model.day_count = 2
+    if between in ("hidden", "notified"):
+        farm.susceptible, farm.exposed = 1100.0, 100.0
+        farm.step_intra_farm()
+    if between == "hidden":
+        farm.susceptible, farm.exposed, farm.infected = 1200.0, 0.0, 0.0
+    farm.notified = between == "notified"
+    if between == "quarantine":
+        farm.quarantined, farm.quarantine_day = True, 1
+        model.day_count = 4
+        farm.try_release_quarantine()
+
+    _collect_on(model, truck, 5)
+
+    lot = model.lots[-1]
+    assert lot.farm_status == status
+    assert lot.quantity == pytest.approx(80.0 * days)
+
+
+@pytest.mark.parametrize(
+    "hub_kind,alive,quantity",
+    [
+        ("slaughterhouse", 1200, 1000.0),  # a full load per visit
+        ("slaughterhouse", 300, 300.0),  # capped by the live flock
+        ("feed_mill", 1200, None),  # feed trucks collect no product
+    ],
+)
+def test_slaughter_lots_are_fixed_loads_that_keep_the_flock(
+    two_way_world, hub_kind, alive, quantity
+):
+    model, truck = _lot_model(
+        two_way_world, hub_kind, {"f1": -34.99}, broiler_lot_birds=1000
+    )
+    (farm,) = model.farms
+    farm.susceptible = float(alive)
+
+    _collect_on(model, truck, 1)
+
+    expected = [] if quantity is None else [quantity]
+    assert [lot.quantity for lot in model.lots] == expected
+    assert farm.susceptible == alive  # the model does not depopulate by lots
+
+
+@pytest.mark.parametrize(
+    "exposed,notified,status",
+    [
+        (0.0, False, "healthy"),
+        (100.0, False, "hidden"),
+        (100.0, True, "notified"),
+    ],
+)
+def test_lot_records_farm_status_at_collection(
+    two_way_world, exposed, notified, status
+):
+    model, truck = _lot_model(two_way_world, "slaughterhouse", {"f1": -34.99})
+    (farm,) = model.farms
+    farm.susceptible -= exposed
+    farm.exposed, farm.notified = exposed, notified
+
+    _collect_on(model, truck, 1)
+
+    (lot,) = model.lots
+    assert (lot.farm_status, lot.exposed) == (status, status == "hidden")
+    tallies = model.lot_summary()["aves"]
+    assert (tallies["exposed"]["lots"], tallies["notified"]["lots"]) == (
+        int(status == "hidden"),
+        int(status == "notified"),
+    )
+
+
+def test_lot_leaves_before_the_visit_that_infects_the_farm(two_way_world):
+    model, truck = _lot_model(
+        two_way_world,
+        "slaughterhouse",
+        {"src": -34.99, "f1": -34.98},
+        max_stops=2,
+        infection_prob_truck_to_farm=100.0,
+        base_biosecurity=0.0,
+    )
+    source, target = model.farms
+    source.susceptible, source.infected = 1100.0, 100.0  # sheds a full load
+
+    _collect_on(model, truck, 1)
+
+    assert [(lot.farm_id, lot.farm_status) for lot in model.lots] == [
+        ("src", "hidden"),
+        ("f1", "healthy"),
+    ]
+    assert target.status == "hidden"
+
+
+def test_default_product_fleets_serve_their_farm_types(two_way_world):
+    model = AgentModel(two_way_world)
+    for hub_kind in ("feed_mill", "slaughterhouse", "egg_grading"):
+        model.add_hub(Facility(hub_kind, hub_kind, -35.0, -8.0))
+    for farm_id, kind, lon, lat in (
+        ("layer", "farm_layer", -34.99, -8.0),
+        ("broiler", "farm_broiler", -34.98, -8.0),
+        ("unknown", "farm", -34.99, -8.01),
+    ):
+        model.add_farm(Facility(farm_id, kind, lon, lat), pop_total=1200)
+
+    model.setup_fleets()
+
+    served = {}
+    for truck in model.trucks:
+        served.setdefault(truck.base.kind, set()).update(
+            farm.farm_id for farm in truck.clients
+        )
+    assert served == {
+        "feed_mill": {"layer", "broiler", "unknown"},
+        "slaughterhouse": {"broiler", "unknown"},
+        "egg_grading": {"layer"},
+    }
+
+
+# Lot days relative to the trace trigger, the farm's status at collection and
+# the expected trace outcome under the 28-day window.
+TRACE_CASES = (
+    (-30, "hidden", "outside_window"),
+    (-29, "healthy", None),  # before the window and harmless: left alone
+    (-28, "hidden", "recalled"),  # the window's first day
+    (-3, "notified", "recalled"),
+)
+
+
+@pytest.mark.parametrize(
+    "protocol,trigger_day",
+    [
+        (0, 41),  # protocol off: traced when notified
+        (1, 43),  # protocol on: traced when the focus is confirmed
+    ],
+)
+def test_lot_recall_window_counts_back_from_the_trigger(
+    tiny_world, protocol, trigger_day
+):
+    model = AgentModel(
+        tiny_world,
+        params=ModelParams(
+            protocol_enabled=protocol,
+            confirmation_days=2,
+            auto_depopulation=0,
+            trace_window_days=28,
+            local_spread_prob=0.0,
+            infection_prob_bird_to_farm=0.0,
+            migratory_flocks_per_day=0.0,
+        ),
+        seed=1,
+    )
+    farm = model.add_farm(Facility("farm", "farm_layer", -35, -8), pop_total=1000)
+    model.day_count = 40
+    farm.susceptible, farm.exposed = 900.0, 100.0
+    farm.first_infection_day, farm.detection_day = 40, 41  # notified on day 41
+    for offset, status, _ in TRACE_CASES:
+        model.record_lot(
+            Lot(trigger_day + offset, "farm", "hub", "t", "ovos", 10.0, status)
+        )
+
+    while model.day_count < trigger_day:
+        model.step()
+
+    assert [(lot.trace, lot.trace_day) for lot in model.lots] == [
+        (outcome, None if outcome is None else trigger_day)
+        for _, _, outcome in TRACE_CASES
+    ]
+    eggs = model.lot_summary()["ovos"]
+    tallies = ("exposed", "recalled", "exposed_recalled", "exposed_outside_window")
+    assert [eggs[tally]["lots"] for tally in tallies] == [2, 2, 1, 1]
+    assert eggs["mean_exposure_days"] == 28.0
+    (recall,) = [e for e in model.events if e.kind == "RECOLHIMENTO_LOTES"]
+    assert (recall.day, recall.farm_id) == (trigger_day, "farm")
+
+    # Still infected and traced: a later lot is recalled the day it ships.
+    model.record_lot(Lot(trigger_day + 1, "farm", "hub", "t", "ovos", 5.0, "notified"))
+    model.step()
+    assert (model.lots[-1].trace, model.lots[-1].trace_day) == (
+        "recalled",
+        trigger_day + 1,
+    )

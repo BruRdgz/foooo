@@ -39,7 +39,7 @@ def test_optional_fastapi_import_is_actionable(tiny_world, monkeypatch):
 
 
 def test_static_metadata_and_admin(client, tiny_world):
-    assert "World inspector" in client.get("/").text
+    assert "SimGeoPE" in client.get("/").text
     assert client.get("/static/app.js").status_code == 200
     assert client.get("/static/styles.css").status_code == 200
     assert client.get("/static/../../config.json").status_code == 404

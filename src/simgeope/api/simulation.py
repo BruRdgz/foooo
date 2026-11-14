@@ -8,7 +8,7 @@ The session also keeps a compact per-day snapshot so past days can be replayed.
 import json
 import threading
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 from typing import NamedTuple
 
@@ -18,9 +18,9 @@ from shapely.geometry import LineString, Point, box
 from simgeope.simulation import AgentModel, ModelParams, infection_risk
 from simgeope.simulation.agents import ZONE_RINGS, Transmission
 from simgeope.simulation.model import (
-    DEMO_POULTRY_POLES,
+    DEFAULT_FARM_POPULATION,
     Event,
-    install_synthetic_facilities,
+    install_official_facilities,
 )
 from simgeope.simulation.params import PARAM_PRESETS, PARAM_SPECS, override_params
 from simgeope.simulation.risk import GREEN, RED, YELLOW
@@ -118,10 +118,13 @@ class DaySnapshot:
 
 
 class SimulationSession:
-    """A resettable scenario on a loaded world, mirroring ``test.py``.
+    """A resettable scenario on a loaded world.
 
     Worlds without facilities get synthetic farms and hubs once, at creation,
-    so every reset reuses the same geography.
+    placed by official municipal data (``install_official_facilities``), so
+    every reset reuses the same geography; hubs exist for the hub kinds of
+    the fleets given at creation. ``pop_total`` is the birds per farm, one
+    value or one per facility kind.
     """
 
     def __init__(
@@ -130,11 +133,9 @@ class SimulationSession:
         *,
         params: ModelParams | None = None,
         seed: int = 42,
-        pop_total: int = 5_000,
+        pop_total: int | Mapping[str, int] = DEFAULT_FARM_POPULATION,
         birds: int = 80,
-        synthetic_farms: int = 120,
-        synthetic_hubs: Mapping[str, int] | None = None,
-        poles: Sequence[str] = DEMO_POULTRY_POLES,
+        hubs_per_fleet: int = 2,
     ):
         self.world = world
         self.params = params or ModelParams()
@@ -142,14 +143,8 @@ class SimulationSession:
         self.birds = birds
         self.synthetic = world.facilities is None
         if self.synthetic:
-            install_synthetic_facilities(
-                world,
-                n=synthetic_farms,
-                hubs=synthetic_hubs
-                if synthetic_hubs is not None
-                else {spec.hub_kind: 2 for spec in self.params.fleets},
-                poles=poles,
-                seed=seed,
+            install_official_facilities(
+                world, self.params.fleets, hubs_per_fleet=hubs_per_fleet, seed=seed
             )
         self._municipality_names = {
             m.code: m.name for m in world.administrative.municipalities
@@ -286,7 +281,11 @@ def add_simulation_routes(app, session: SimulationSession) -> None:
             "day": model.day_count,
             "date": model.current_date.isoformat(),
             "seed": session.seed,
+            # Synthetic facilities are placed by official municipal data.
             "synthetic_facilities": session.synthetic,
+            "farms_by_kind": dict(
+                sorted(Counter(f.facility.kind for f in model.farms).items())
+            ),
             "healthy_farms": model.healthy_farms,
             "notified_farms": model.notified_farms,
             "hidden_farms": model.hidden_farms,
@@ -396,6 +395,7 @@ def add_simulation_routes(app, session: SimulationSession) -> None:
             "name": facility.name,
             "municipality": session.municipality(facility),
             "kind": facility.kind,
+            "production": farm.production,
             "pop_total": farm.pop_total,
             **row._asdict(),
         }

@@ -40,8 +40,10 @@ def test_step_shows_seeded_farm_and_todays_road_trips(client, session):
         1,
     )
     assert state["synthetic_facilities"] is False
+    assert state["farms_by_kind"] == {"producer": 1}
     (farm,) = client.get("/api/sim/farms").json()["features"]
     assert farm["properties"]["id"] == "b"
+    assert farm["properties"]["production"] is None  # unknown production type
     assert farm["properties"]["status"] == "hidden"  # exposed, not yet notified
 
     assert client.post("/api/sim/step", json={"days": 1}).json()["day"] == 1
@@ -62,6 +64,13 @@ def test_step_shows_seeded_farm_and_todays_road_trips(client, session):
         client.get("/api/sim/events", params={"since": events["next"]}).json()["events"]
         == []
     )
+
+
+def test_session_without_facilities_needs_the_reference_municipalities(tiny_world):
+    # No silent fallback to illustrative poles on a world the data misses.
+    tiny_world.facilities = None
+    with pytest.raises(ValueError, match="World lacks"):
+        SimulationSession(tiny_world, birds=0)
 
 
 def test_manual_stamping_out_draws_zone_and_reset_restores(client):

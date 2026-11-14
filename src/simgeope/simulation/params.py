@@ -86,10 +86,17 @@ class ModelParams:
     # "farm_layer"/"farm_broiler" are postura/corte (see FarmAgent.production);
     # "farm" and "producer" are farms of unknown production type.
     farm_kinds: tuple[str, ...] = ("farm", "producer", "farm_layer", "farm_broiler")
-    # Illustrative defaults, to be calibrated against real fleet data.
+    # Illustrative defaults, to be calibrated against real fleet data. Feed
+    # reaches every farm; live birds go to slaughter from broiler farms and,
+    # for worlds without production types, from farms of unknown type.
     fleets: tuple[FleetSpec, ...] = (
         FleetSpec("feed_mill", trucks_per_hub=3, max_stops_per_day=4),
-        FleetSpec("slaughterhouse", trucks_per_hub=2, max_stops_per_day=1),
+        FleetSpec(
+            "slaughterhouse",
+            trucks_per_hub=2,
+            max_stops_per_day=1,
+            client_kinds=("farm_broiler", "farm", "producer"),
+        ),
     )
     truck_shift_hours: float = 10.0
     truck_service_minutes: float = 45.0  # carga/descarga por parada
@@ -540,10 +547,15 @@ class ParamPreset:
 
 
 # Illustrative scenarios, not calibrated. Chosen from 120-day runs of seeds 1-10
-# with the demo's synthetic farms (120 farms around the demo poles, 2 hubs per
-# fleet) on a grid-road test world and once on the Pernambuco world:
-# "surto_sustentado" kept >= 5 infected farms at day 120 in 8/10 and 7/10
-# seeds, and in "cadeia_logistica" trucks caused most farm introductions.
+# with the earlier demo population (120 farms of 5,000 birds around the demo
+# poles, 2 hubs per fleet) on a grid-road test world and once on the
+# Pernambuco world: "surto_sustentado" kept >= 5 infected farms at day 120 in
+# 8/10 and 7/10 seeds, and in "cadeia_logistica" trucks caused most farm
+# introductions. With the official-data population (docs/FONTES_DADOS.md:
+# 267 farms of about 215-256 thousand birds) on the Pernambuco world, the same
+# runs gave 4/10 for "surto_sustentado", and in "cadeia_logistica" trucks
+# caused 1 of 18 introductions after the initial ones: the presets need
+# recalibrating for that population.
 _SUSTAINED_OUTBREAK = {
     "local_spread_prob": 25.0,
     "local_spread_radius_km": 6.0,

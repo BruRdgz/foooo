@@ -1,5 +1,6 @@
 """Wild-bird SIR flow, neighbourhood spread, outbreak end and demo scenario."""
 
+import csv
 import importlib.util
 import math
 
@@ -8,9 +9,22 @@ import pytest
 if importlib.util.find_spec("mesa") is None:
     pytest.skip("Requires the optional simulation extra", allow_module_level=True)
 
-from simgeope.simulation import AgentModel, ModelParams
-from simgeope.simulation.agents import local_spread_prob
-from simgeope.simulation.model import dominant_source, install_synthetic_facilities
+from simgeope.simulation import AgentModel, FleetSpec, ModelParams
+from simgeope.simulation.agents import (
+    BROILER_FARM_KIND,
+    EGG_HUB_KIND,
+    LAYER_FARM_KIND,
+    local_spread_prob,
+)
+from simgeope.simulation.model import (
+    ADAGRO_REGISTERED_FARMS,
+    PPM_BROILER_PROXY_2024,
+    REFERENCE_TABLE,
+    dominant_source,
+    install_official_facilities,
+    install_synthetic_facilities,
+    reference_farm_weights,
+)
 from simgeope.world.facilities import Facility
 
 # Birds stay put and never leave, and nobody arrives, unless a test says so.
@@ -218,6 +232,120 @@ def test_synthetic_poles_cluster_on_connected_roads(two_way_world):
     assert {f.road_node for f in facilities} <= {10, 20, 30, 40}
     with pytest.raises(ValueError, match="Unknown pole"):
         install_synthetic_facilities(two_way_world, poles=("Atlântida",))
+
+
+RECIFE, NORONHA = "2611606", "2605459"
+# Layers only in Recife, broilers only in Noronha, so every site reveals
+# which kind's weights drew it.
+SPLIT_WEIGHTS = {
+    LAYER_FARM_KIND: {RECIFE: 5, NORONHA: 0},
+    BROILER_FARM_KIND: {RECIFE: 0, NORONHA: 2},
+}
+OFFICIAL_FLEETS = (
+    FleetSpec("feed_mill", 1, 1),
+    FleetSpec("slaughterhouse", 1, 1, client_kinds=(BROILER_FARM_KIND, "farm")),
+    FleetSpec(EGG_HUB_KIND, 1, 1, client_kinds=(LAYER_FARM_KIND,)),
+)
+
+
+def test_official_placement_draws_sites_by_kind_and_served_production(tiny_world):
+    # Without roads nothing is snapped, so Noronha is a valid site too.
+    tiny_world.roads = None
+    facilities = install_official_facilities(
+        tiny_world,
+        OFFICIAL_FLEETS,
+        farms={LAYER_FARM_KIND: 4, BROILER_FARM_KIND: 3},
+        hubs_per_fleet=2,
+        weights=SPLIT_WEIGHTS,
+        seed=1,
+    ).facilities
+    sites = {(f.id, f.municipality_code) for f in facilities}
+    assert {(f"P{i:04d}", RECIFE) for i in range(1, 5)} <= sites
+    assert {(f"C{i:04d}", NORONHA) for i in range(1, 4)} <= sites
+    # Hubs follow the production their fleet serves; a new hub kind too.
+    assert {(f"{EGG_HUB_KIND}-{i:02d}", RECIFE) for i in (1, 2)} <= sites
+    assert {(f"slaughterhouse-{i:02d}", NORONHA) for i in (1, 2)} <= sites
+    assert sum(f.kind == "feed_mill" for f in facilities) == 2
+    assert len(facilities) == 13
+
+
+def test_official_placement_uses_connected_roads(two_way_world):
+    facilities = install_official_facilities(
+        two_way_world,
+        OFFICIAL_FLEETS,
+        farms={LAYER_FARM_KIND: 3, BROILER_FARM_KIND: 3},
+        weights={LAYER_FARM_KIND: {RECIFE: 1}, BROILER_FARM_KIND: {RECIFE: 1}},
+        seed=2,
+    ).facilities
+    assert len(facilities) == 12
+    assert {f.road_node for f in facilities} <= {10, 20, 30, 40}
+
+
+@pytest.mark.parametrize(
+    "fleets,farms,weights,message",
+    [
+        # The default reference table names municipalities the tiny world lacks.
+        (OFFICIAL_FLEETS, None, None, "World lacks"),
+        (
+            (FleetSpec("slaughterhouse", 1, 1, client_kinds=("farm",)),),
+            None,
+            SPLIT_WEIGHTS,
+            "serve none",
+        ),
+        (OFFICIAL_FLEETS, {"farm": 1}, SPLIT_WEIGHTS, "No municipal weights"),
+        (
+            OFFICIAL_FLEETS,
+            None,
+            {LAYER_FARM_KIND: {RECIFE: 0}, BROILER_FARM_KIND: {RECIFE: 1}},
+            "positive weight",
+        ),
+    ],
+)
+def test_official_placement_rejects_data_that_does_not_fit(
+    tiny_world, fleets, farms, weights, message
+):
+    with pytest.raises(ValueError, match=message):
+        install_official_facilities(
+            tiny_world,
+            fleets,
+            farms=farms or {LAYER_FARM_KIND: 1, BROILER_FARM_KIND: 1},
+            weights=weights,
+        )
+    assert {f.id for f in tiny_world.facilities.facilities} == {"a", "b"}
+
+
+def test_reference_table_matches_cited_totals():
+    weights = reference_farm_weights()
+    with REFERENCE_TABLE.open(encoding="utf-8", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    codes = [row["codigo_ibge"] for row in rows]
+    assert len(set(codes)) == len(codes) == 185
+    assert all(len(code) == 7 and code.startswith("26") for code in codes)
+    assert sum(weights[BROILER_FARM_KIND].values()) == PPM_BROILER_PROXY_2024
+    assert sum(int(row["granjas_adagro_2022"]) for row in rows) == (
+        ADAGRO_REGISTERED_FARMS
+    )
+    for row in rows:
+        assert int(row["galinaceos_2024"]) == int(row["galinhas_2024"]) + int(
+            row["corte_proxy_2024"]
+        )
+
+
+@pytest.mark.parametrize(
+    "pop_total,expected",
+    [(7, 7), ({"producer": 9, "farm_layer": 1}, 9)],
+)
+def test_farm_population_per_kind(tiny_world, pop_total, expected):
+    model = _model(tiny_world)
+    assert model.add_farms_from_world(pop_total=pop_total) == 1
+    assert model.farm_by_id("b").pop_total == expected
+
+
+def test_farm_population_missing_kind_adds_no_farm(tiny_world):
+    model = _model(tiny_world)
+    with pytest.raises(ValueError, match="producer"):
+        model.add_farms_from_world(pop_total={"farm": 9})
+    assert model.farms == []
 
 
 # Official protocol on a scale that fits the tiny world (farms ~1.1 km apart).

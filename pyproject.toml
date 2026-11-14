@@ -25,7 +25,7 @@ simgeope = "simgeope.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-simgeope = ["web/*.html", "web/*.js", "web/*.css"]
+simgeope = ["web/*.html", "web/*.js", "web/*.css", "simulation/reference/*.csv"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

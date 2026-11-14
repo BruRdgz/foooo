@@ -426,8 +426,8 @@ export function createSim(map, {onLayersChanged, isActive}) {
     const s = sim.state;
     const notes = [];
     if (s.synthetic_facilities) {
-      notes.push(h('span', {}, 'Granjas sintéticas, não reais: número, porte e município sorteados por dados oficiais '
-        + '(IBGE PPM 2024, POG 1º tri 2025, ADAGRO); bases posicionadas por suposição. Fontes em ', h('code', {}, 'docs/FONTES_DADOS.md'), '.'));
+      notes.push(h('span', {}, 'Granjas sintéticas, não reais: municípios sorteados por dados oficiais '
+        + '(IBGE PPM 2024, POG 1º tri 2025, ADAGRO); número e porte das granjas de corte e posição das bases são suposições. Fontes em ', h('code', {}, 'docs/FONTES_DADOS.md'), '.'));
     }
     if (!s.risk_available) notes.push('Risco indisponível: o mundo não tem raster ambiental.');
     if (protocolOn()) notes.push('Protocolo oficial de trânsito (MAPA) ativo; as suposições estão marcadas em Cenário e parâmetros.');

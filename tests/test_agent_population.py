@@ -613,6 +613,44 @@ def test_egg_lots_carry_what_was_laid_since_the_last_collection(two_way_world):
 
 
 @pytest.mark.parametrize(
+    "between,status,days",
+    [
+        (None, "healthy", 4),
+        # The infection ended undetected before the visit: still exposed.
+        ("hidden", "hidden", 4),
+        ("notified", "notified", 4),
+        # Assumption: eggs held under quarantine are destroyed on the farm.
+        ("quarantine", "healthy", 1),
+    ],
+)
+def test_egg_lot_status_covers_every_day_since_the_last_collection(
+    two_way_world, between, status, days
+):
+    model, truck = _lot_model(
+        two_way_world, "egg_grading", {"f1": -34.99}, quarantine_release_days=0
+    )
+    (farm,) = model.farms
+    _collect_on(model, truck, 1)
+    model.day_count = 2
+    if between in ("hidden", "notified"):
+        farm.susceptible, farm.exposed = 1100.0, 100.0
+        farm.step_intra_farm()
+    if between == "hidden":
+        farm.susceptible, farm.exposed, farm.infected = 1200.0, 0.0, 0.0
+    farm.notified = between == "notified"
+    if between == "quarantine":
+        farm.quarantined, farm.quarantine_day = True, 1
+        model.day_count = 4
+        farm.try_release_quarantine()
+
+    _collect_on(model, truck, 5)
+
+    lot = model.lots[-1]
+    assert lot.farm_status == status
+    assert lot.quantity == pytest.approx(80.0 * days)
+
+
+@pytest.mark.parametrize(
     "hub_kind,alive,quantity",
     [
         ("slaughterhouse", 1200, 1000.0),  # a full load per visit

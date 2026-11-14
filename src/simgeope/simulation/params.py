@@ -100,8 +100,8 @@ class ModelParams:
     # reaches every farm; live birds go to slaughter from broiler farms and,
     # for worlds without production types, from farms of unknown type. Product
     # fleets (slaughterhouse: live birds; egg_grading: eggs) also record a lot
-    # per farm collection (see agents.Lot). The egg fleet's trays and boxes
-    # returning through the entreposto are its fomite pathway (hub exchange).
+    # per farm collection (see agents.Lot). Egg trucks carry fomites like the
+    # others: farm to farm along the tour and through the entreposto.
     fleets: tuple[FleetSpec, ...] = (
         FleetSpec("feed_mill", trucks_per_hub=3, max_stops_per_day=4),
         FleetSpec(

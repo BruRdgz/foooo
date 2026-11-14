@@ -180,7 +180,9 @@ class Lot:
 
     `quantity` is in dozens for "ovos" and birds for "aves". `farm_status` is
     the farm's ``FarmAgent.status`` before the visit: "hidden" means it left
-    an infected, not yet notified farm (an exposed lot). When its farm is
+    an infected, not yet notified farm (an exposed lot). An egg lot is also
+    "hidden" if the farm was on any day since the last egg collection, unless
+    it is notified by now. When its farm is
     traced, the model replaces the lot with a copy whose `trace` is
     "recalled" or, for an exposed lot collected before the trace window,
     "outside_window", and `trace_day` the day of that trace; other lots keep
@@ -261,6 +263,9 @@ class FarmAgent(Agent):
 
         # Eggs laid since this day leave with the next egg-truck collection.
         self.last_egg_collection_day: int = model.day_count
+        # Some of those eggs were laid while the farm was infected and not
+        # notified, so the next egg lot is exposed whatever the status then.
+        self.eggs_laid_hidden: bool = False
 
         model.agents_by_id[farm_id] = self
 
@@ -310,6 +315,8 @@ class FarmAgent(Agent):
 
     # ---------------------------------------------------------- SEIR step
     def step_intra_farm(self) -> None:
+        if self.status == "hidden":
+            self.eggs_laid_hidden = True
         if self.culled or self.housed <= 0:
             return
 
@@ -489,6 +496,10 @@ class FarmAgent(Agent):
             >= free_since + self.model.params.quarantine_release_days
         ):
             self.quarantined = False
+            # Assumption: eggs held on the interdicted farm are destroyed
+            # there, not shipped with the first collection after release.
+            self.last_egg_collection_day = self.model.day_count
+            self.eggs_laid_hidden = False
             self.model.log_event(
                 "LIBERACAO_QUARENTENA",
                 f"Granja {self.farm_id}: quarentena encerrada",
@@ -510,7 +521,12 @@ class FarmAgent(Agent):
         if not p.protocol_enabled:
             return
         today = self.model.day_count
-        if self.culled and today >= self.cull_day + p.fallow_days:
+        # A confirmation still pending would depopulate the new flock.
+        if (
+            self.culled
+            and today >= self.cull_day + p.fallow_days
+            and not self.model.focus_pending(self)
+        ):
             self._new_flock(round(self.pop_total * p.restock_pct / 100.0))
             self.culled = self.quarantined = False
             self.restocked, self.restock_day = True, today
@@ -547,6 +563,7 @@ class FarmAgent(Agent):
         # Eggs are counted from the new flock's housing, not the last
         # collection before the cull.
         self.last_egg_collection_day = self.model.day_count
+        self.eggs_laid_hidden = False
         self.first_infection_day = self.detection_day = self.reaction_day = -1
         self.notified = False
         self.surveillance_detection = False
@@ -563,6 +580,7 @@ class FarmAgent(Agent):
         self.exposed = 0.0
         self.infected = 0.0
         self.recovered = 0.0
+        self.housed = 0
         self.culled = True
         self.restocked = False
         self.cull_day = self.model.day_count
@@ -934,10 +952,14 @@ class TruckAgent(Agent):
         p = self.model.params
         today = self.model.day_count
         alive = farm.susceptible + farm.exposed + farm.infected + farm.recovered
+        status = farm.status
         if product == "ovos":
             days = today - farm.last_egg_collection_day
             farm.last_egg_collection_day = today
             quantity = alive * p.eggs_per_hen_day * days / EGGS_PER_DOZEN
+            if farm.eggs_laid_hidden and status != "notified":
+                status = "hidden"
+            farm.eggs_laid_hidden = False
         else:
             quantity = min(float(p.broiler_lot_birds), alive)
         if quantity > 0:
@@ -949,7 +971,7 @@ class TruckAgent(Agent):
                     truck_id=self.truck_id,
                     product=product,
                     quantity=quantity,
-                    farm_status=farm.status,
+                    farm_status=status,
                 )
             )
 

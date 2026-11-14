@@ -1211,6 +1211,10 @@ class AgentModel(WorldModel):
                 self._settle_release(focus)
         self._update_zones()
 
+    def focus_pending(self, farm: FarmAgent) -> bool:
+        """Whether samples of `farm` await laboratory confirmation."""
+        return any(pending is farm for _, pending in self._pending_foci)
+
     def _confirm_focus(self, farm: FarmAgent) -> None:
         p = self.params
         today = self.day_count

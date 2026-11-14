@@ -199,22 +199,28 @@ Frotas padrão (`ModelParams.fleets`, sem edição na interface):
   por dia, atende só `farm_layer`. **Suposição**: não há dado aberto sobre a
   frequência de coleta nem o tamanho da frota.
 
-A frota de ovos não tem mecanismo de fômite próprio: bandejas e caixas que
-voltam contaminadas pelo entreposto são o caminho já modelado de troca de
-carga entre caminhão e base (`hub_transfer_fraction`, lavagem na base).
+Os caminhões de ovos usam o mesmo mecanismo de fômite das outras frotas:
+recolhem carga viral numa granja de postura que elimina vírus e podem
+introduzi-la na granja seguinte do roteiro, além da troca de carga com o
+entreposto (`hub_transfer_fraction`, lavagem na base), que representa
+bandejas e caixas que voltam contaminadas.
 
 ### Regras do modelo
 
 - **Lote**: cada coleta de um caminhão de abatedouro ("aves") ou de
   entreposto ("ovos") numa granja gera um lote com dia, granja, base de
   destino, caminhão, quantidade e o estado da granja *antes* da visita:
-  `hidden` (infectada sem notificação: **lote exposto**), `notified` ou
-  `healthy`. Granjas em quarentena ou abatidas não são visitadas.
+  `hidden` (infectada sem notificação: **lote exposto**), `notified`,
+  `healthy` ou `restocked`. Granjas em quarentena ou abatidas não são
+  visitadas.
 - **Ovos**: dúzias postas desde a última coleta de ovos da granja, com o
   plantel vivo no dia da coleta (S + E + I + R) × `eggs_per_hen_day` ÷ 12.
-  A queda de postura em aves doentes não é modelada. Ovos postos durante a
-  quarentena saem na primeira coleta após a liberação (o descarte não é
-  representado).
+  A queda de postura em aves doentes não é modelada. Se a granja esteve
+  infectada sem notificação em algum dia desde a última coleta, o lote de
+  ovos é exposto mesmo que a infecção já tenha acabado (salvo se a granja
+  estiver notificada na coleta). Suposição: os ovos postos durante a
+  quarentena são destruídos na granja; a contagem recomeça na liberação. No
+  repovoamento total, os dias anteriores são contados com o plantel cheio.
 - **Aves**: `broiler_lot_birds` por visita, limitado ao plantel vivo. O modelo
   não simula ciclos de produção e não retira essas aves do plantel.
 - **Rastreamento**: com o protocolo oficial ligado, o gatilho é a

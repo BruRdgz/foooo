@@ -734,9 +734,9 @@ def test_mortality_over_window_notifies_before_drawn_day(
         (
             1,
             ["culled"] * 2 + ["restocked"] * 3 + ["healthy"] * 2,
-            [100, 100, 20, 20, 20, 100, 100],
+            [0, 0, 20, 20, 20, 100, 100],
         ),
-        (0, ["culled"] * 7, [100] * 7),  # without the protocol a cull is final
+        (0, ["culled"] * 7, [0] * 7),  # without the protocol a cull is final
     ],
 )
 def test_culled_farm_is_restocked_after_fallow_then_filled(
@@ -828,3 +828,24 @@ def test_restocked_focus_is_inspected_and_becomes_a_focus_again(tiny_world):
     assert "repovoamento" in found.details
     assert [f.farm_id for f in model.foci] == ["farm", "farm"]
     assert (farm.status, farm.cull_day) == ("culled", 5)
+
+
+def test_pending_confirmation_holds_restocking_until_it_returns(tiny_world):
+    model = _model(
+        tiny_world, **PROTOCOL, confirmation_days=4, fallow_days=1, restock_pct=50.0
+    )
+    farm = model.add_farm(Facility("farm", "farm", -35, -8), pop_total=1000)
+    farm.susceptible, farm.exposed = 900.0, 100.0
+    farm.first_infection_day, farm.detection_day = 0, 1
+
+    model.step()  # notified; samples sent, confirmation due on day 5
+    farm.apply_stamping_out()
+    for _ in range(5):
+        model.step()
+
+    kinds = {"FOCO_CONFIRMADO", "DESPOVOAMENTO", "REPOVOAMENTO"}
+    events = [(e.day, e.kind) for e in model.events if e.kind in kinds]
+    # The confirmation finds the farm still empty instead of culling a new flock.
+    assert events == [(5, "FOCO_CONFIRMADO"), (5, "REPOVOAMENTO")]
+    assert model.total_culled == 1000.0
+    assert (farm.status, farm.housed) == ("restocked", 500)

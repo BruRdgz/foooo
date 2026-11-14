@@ -16,7 +16,7 @@ import numpy as np
 from shapely.geometry import LineString, Point, box
 
 from simgeope.simulation import AgentModel, ModelParams, infection_risk
-from simgeope.simulation.agents import ZONE_RINGS, Transmission
+from simgeope.simulation.agents import HUB_PRODUCTS, ZONE_RINGS, Transmission
 from simgeope.simulation.model import (
     DEMO_POULTRY_POLES,
     Event,
@@ -310,6 +310,7 @@ def add_simulation_routes(app, session: SimulationSession) -> None:
             "max_step_days": MAX_STEP_DAYS,
             "active_quarantines": model.active_quarantines,
             "protocol": protocol_state(model),
+            "lots": model.lot_summary(),
         }
 
     @app.get("/api/sim/state")
@@ -699,6 +700,66 @@ def add_simulation_routes(app, session: SimulationSession) -> None:
                 "transmissions": [
                     asdict(t) | {"path": transmission_path(t, hubs_by_id)}
                     for t in window
+                ],
+                "hubs": hubs,
+            }
+
+    @app.get("/api/sim/lots")
+    def lots(from_day: int | None = None, to_day: int | None = None):
+        """Product lots collected in the window, and product hubs ranked by them.
+
+        `exposure_days` is recall day minus collection day for recalled lots
+        and null otherwise. Hub tallies count the window's lots by their
+        destination hub, most exposed lots first.
+        """
+        check_window(from_day, to_day)
+        with session.lock:
+            model = session.model
+            low = 0 if from_day is None else from_day
+            high = model.day_count if to_day is None else to_day
+            window = [lot for lot in model.lots if low <= lot.day <= high]
+            by_hub: dict[str, Counter[str]] = {}
+            for lot in window:
+                tally = by_hub.setdefault(lot.hub_id, Counter())
+                tally["lots"] += 1
+                tally["quantity"] += lot.quantity
+                if lot.exposed:
+                    tally["exposed_lots"] += 1
+                    tally["exposed_quantity"] += lot.quantity
+                if lot.trace is not None:
+                    tally[f"{lot.trace}_lots"] += 1
+            hubs = []
+            for hub in model.hubs:
+                if hub.kind not in HUB_PRODUCTS:
+                    continue
+                tally = by_hub.get(hub.hub_id, Counter())
+                hubs.append(
+                    {
+                        "id": hub.hub_id,
+                        "name": hub.facility.name,
+                        "kind": hub.kind,
+                        "product": HUB_PRODUCTS[hub.kind],
+                        "lon": hub.lon,
+                        "lat": hub.lat,
+                        "lots": tally["lots"],
+                        "quantity": float(tally["quantity"]),
+                        "exposed_lots": tally["exposed_lots"],
+                        "exposed_quantity": float(tally["exposed_quantity"]),
+                        "recalled_lots": tally["recalled_lots"],
+                        "outside_window_lots": tally["outside_window_lots"],
+                    }
+                )
+            hubs.sort(key=lambda hub: (-hub["exposed_lots"], hub["id"]))
+            return {
+                "lots": [
+                    asdict(lot)
+                    | {
+                        "exposed": lot.exposed,
+                        "exposure_days": None
+                        if lot.trace != "recalled"
+                        else lot.trace_day - lot.day,
+                    }
+                    for lot in window
                 ],
                 "hubs": hubs,
             }

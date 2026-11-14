@@ -86,10 +86,28 @@ class ModelParams:
     # "farm_layer"/"farm_broiler" are postura/corte (see FarmAgent.production);
     # "farm" and "producer" are farms of unknown production type.
     farm_kinds: tuple[str, ...] = ("farm", "producer", "farm_layer", "farm_broiler")
-    # Illustrative defaults, to be calibrated against real fleet data.
+    # Illustrative defaults, to be calibrated against real fleet data. Product
+    # fleets (slaughterhouse: live birds; egg_grading: eggs) also record a lot
+    # per farm collection (see agents.Lot). Slaughter trucks serve broiler
+    # farms and farms of unknown type, so worlds without farm_layer/
+    # farm_broiler keep their behaviour. The egg fleet's trays and boxes
+    # returning through the entreposto are its fomite pathway (hub exchange).
     fleets: tuple[FleetSpec, ...] = (
         FleetSpec("feed_mill", trucks_per_hub=3, max_stops_per_day=4),
-        FleetSpec("slaughterhouse", trucks_per_hub=2, max_stops_per_day=1),
+        FleetSpec(
+            "slaughterhouse",
+            trucks_per_hub=2,
+            max_stops_per_day=1,
+            client_kinds=("farm_broiler", "farm", "producer"),
+        ),
+        # Assumption: no open data on egg-collection frequency or fleet size;
+        # one truck collects at a few laying farms per day.
+        FleetSpec(
+            "egg_grading",
+            trucks_per_hub=2,
+            max_stops_per_day=3,
+            client_kinds=("farm_layer",),
+        ),
     )
     truck_shift_hours: float = 10.0
     truck_service_minutes: float = 45.0  # carga/descarga por parada
@@ -103,6 +121,16 @@ class ModelParams:
     # Fraction of load exchanged between a truck and its base hub's environment.
     hub_transfer_fraction: float = 0.5
     truck_disinfection_prob: float = 0.5  # lavagem ao voltar à base
+
+    # --- produção e mercados (lotes e rastreamento) -----------------------
+    # Eggs per live hen per day (IBGE POG, PE, 1st quarter 2025; derivation
+    # in the ParamSpec source and docs/FONTES_DADOS.md).
+    eggs_per_hen_day: float = 0.8
+    # Live birds per slaughter-truck visit; the flock is not reduced by it.
+    broiler_lot_birds: int = 5000
+    # Lots collected this many days before the trigger are recalled (two
+    # 14-day incubation periods, Plano de Contingência §7.1).
+    trace_window_days: int = 28
 
     # --- camada de risco (probabilidade diária de introdução) -------------
     # Initial cut-offs at default parameters: a fully loaded truck visit to a
@@ -173,6 +201,7 @@ _SURVEILLANCE = "Vigilância e reação"
 _BIRDS = "Aves silvestres"
 _LOCAL = "Transmissão local"
 _FOMITES = "Fômites (caminhões)"
+_MARKETS = "Produção e mercados"
 _RISK = "Camada de risco"
 _ECONOMY = "Intervenções e economia"
 _PROTOCOL = "Protocolo oficial (MAPA POP 2023)"
@@ -324,6 +353,43 @@ PARAM_SPECS: tuple[ParamSpec, ...] = (
     ),
     ParamSpec(
         "truck_disinfection_prob", "Chance de lavagem na base", _FOMITES, 0, 1, 0.05
+    ),
+    ParamSpec(
+        "eggs_per_hen_day",
+        "Produção de ovos por poedeira",
+        _MARKETS,
+        0,
+        1,
+        0.01,
+        "ovos/dia",
+        source="IBGE, Pesquisa da Produção de Ovos de Galinha (tabela 7524), "
+        "PE, 1º tri 2025: 79.752 mil dúzias × 12 ÷ (13.352.483 poedeiras × 90 "
+        "dias) = 0,796 ovo/ave/dia",
+    ),
+    ParamSpec(
+        "broiler_lot_birds",
+        "Aves vivas por carga de abate",
+        _MARKETS,
+        100,
+        30_000,
+        100,
+        "aves",
+        assumption=True,
+        source="suposição: uma carga de caminhão de frango vivo; não há dado "
+        "aberto sobre tamanho de lote, e o modelo não simula ciclos de "
+        "produção nem retira as aves do plantel",
+    ),
+    ParamSpec(
+        "trace_window_days",
+        "Janela de rastreamento e recolhimento",
+        _MARKETS,
+        0,
+        90,
+        1,
+        "dias",
+        source="Plano de Contingência MAPA IAAP/DNC, jun/2023, §7.1: destruição "
+        "de carne, ovos e subprodutos de dois períodos de incubação (Código "
+        "Terrestre da OMSA); Ficha Técnica IA: incubação de até 14 dias",
     ),
     ParamSpec("risk_yellow_threshold", "Limiar amarelo", _RISK, 0, 1, 0.01),
     ParamSpec("risk_red_threshold", "Limiar vermelho", _RISK, 0, 1, 0.01),

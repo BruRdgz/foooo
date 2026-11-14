@@ -7,7 +7,7 @@ import math
 import warnings
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import astuple, dataclass, fields
+from dataclasses import astuple, dataclass, fields, replace
 from datetime import date, timedelta
 from itertools import takewhile
 from pathlib import Path
@@ -23,10 +23,12 @@ from simgeope.world.facilities import Facility, FacilityIndex, snap_facility
 
 from .agents import (
     FARM_STATUSES,
+    HUB_PRODUCTS,
     ZONE_RINGS,
     BirdAgent,
     FarmAgent,
     HubAgent,
+    Lot,
     Transmission,
     TruckAgent,
     TruckMovement,
@@ -80,6 +82,18 @@ INTRODUCTION_EVENTS = (
     "INTRODUCAO_VIZINHANCA",
     "INTRODUCAO_AVES_MIGRATORIAS",
 )
+# Cumulative lot tallies per product, each a lot count and a quantity:
+# shipped from hidden (exposed) or notified farms, recalled (any status),
+# exposed and recalled, exposed but collected before the trace window.
+LOT_TALLIES = (
+    "exposed",
+    "notified",
+    "recalled",
+    "exposed_recalled",
+    "exposed_outside_window",
+)
+# Unit of `Lot.quantity` per product, as shown in event details.
+LOT_UNITS = {"ovos": "dúzias de ovos", "aves": "aves"}
 
 
 class Event(NamedTuple):
@@ -184,6 +198,18 @@ class AgentModel(WorldModel):
         # farms awaiting confirmation as (due day, farm) in notification order.
         self.foci: list[Focus] = []
         self._pending_foci: list[tuple[int, FarmAgent]] = []
+        # Product lots in collection order (see _trace_lots). Per farm, the
+        # indices of lots no trace has reached yet; farms being traced, with
+        # their window's first day; and what the last trace call had seen.
+        self.lots: list[Lot] = []
+        self._untraced_lots: dict[str, list[int]] = {}
+        self._tracing: dict[str, int] = {}
+        self._traced_foci = 0
+        self._notified_ids: set[str] = set()
+        # Running (product, tally) totals, so daily history stays O(1).
+        self._lot_counts: Counter[tuple[str, str]] = Counter()
+        self._lot_quantities: Counter[tuple[str, str]] = Counter()
+        self._exposure_days: Counter[str] = Counter()
         self._farms_by_facility_id: dict[str, FarmAgent] = {}
         # Origin road node -> travel times to every stop node (see below).
         self._stop_node_index: dict[int, int] | None = None
@@ -201,7 +227,7 @@ class AgentModel(WorldModel):
         self.birds_arrived: int = 0
         self.flocks_arrived: int = 0
         # One summary row per day from day 0, for plots.
-        self.history: list[dict[str, float | dict[str, int]]] = []
+        self.history: list[dict[str, object]] = []
         self._bird_serial = 0
         self._state_metric = None
         self._water_cache: tuple[list, np.ndarray] | None = None
@@ -637,6 +663,7 @@ class AgentModel(WorldModel):
                     if f.notified and not before
                 ]
             )
+        self._trace_lots()
         for f in self.farms:
             f.try_quarantine()
             f.try_release_quarantine()
@@ -927,6 +954,119 @@ class AgentModel(WorldModel):
         for hub, ring in zip(self.hubs, hub_rings, strict=True):
             hub.zone = ZONE_RINGS[ring] if ring < outside else None
 
+    # ------------------------------------------- product lots and tracing
+    def record_lot(self, lot: Lot) -> None:
+        """Register a lot collected today, tallying it if its farm was infected."""
+        self._untraced_lots.setdefault(lot.farm_id, []).append(len(self.lots))
+        self.lots.append(lot)
+        if lot.farm_status in ("hidden", "notified"):
+            self._tally(lot, "exposed" if lot.exposed else "notified")
+
+    def _tally(self, lot: Lot, tally: str) -> None:
+        self._lot_counts[lot.product, tally] += 1
+        self._lot_quantities[lot.product, tally] += lot.quantity
+
+    def _trace_lots(self) -> None:
+        """Recall the lots of farms that became foci today (or were notified).
+
+        The trigger is a focus confirmation with the official protocol on and
+        a notification with it off; the window starts ``trace_window_days``
+        before the trigger day. A traced farm keeps having its new lots
+        recalled until it is culled or its infection ends, since a notified
+        farm still ships until it is quarantined.
+        """
+        p = self.params
+        today = self.day_count
+        if p.protocol_enabled:
+            triggers = [
+                (focus.farm_id, focus.confirmed_day)
+                for focus in self.foci[self._traced_foci :]
+            ]
+            self._traced_foci = len(self.foci)
+        else:
+            notified = [farm.farm_id for farm in self.farms if farm.notified]
+            triggers = [
+                (farm_id, today)
+                for farm_id in notified
+                if farm_id not in self._notified_ids
+            ]
+            self._notified_ids = set(notified)
+        for farm_id, day in triggers:
+            self._tracing[farm_id] = day - p.trace_window_days
+        for farm_id, start in list(self._tracing.items()):
+            self._recall(farm_id, start)
+            farm = self.farm_by_id(farm_id)
+            if farm.culled or farm.exposed + farm.infected <= 0:
+                del self._tracing[farm_id]
+
+    def _recall(self, farm_id: str, start: int) -> None:
+        """Settle every untraced lot of `farm_id` against a window from `start`.
+
+        Lots from `start` on are recalled today. Exposed lots collected
+        before it are counted as outside the window; the rest are dropped,
+        since any later trace has a later window.
+        """
+        today = self.day_count
+        recalled: list[Lot] = []
+        outside: list[Lot] = []
+        for i in self._untraced_lots.pop(farm_id, ()):
+            lot = self.lots[i]
+            if lot.day >= start:
+                self.lots[i] = replace(lot, trace="recalled", trace_day=today)
+                recalled.append(lot)
+                self._tally(lot, "recalled")
+                if lot.exposed:
+                    self._tally(lot, "exposed_recalled")
+                    self._exposure_days[lot.product] += today - lot.day
+            elif lot.exposed:
+                self.lots[i] = replace(lot, trace="outside_window", trace_day=today)
+                outside.append(lot)
+                self._tally(lot, "exposed_outside_window")
+        if not recalled and not outside:
+            return
+
+        def amounts(lots: list[Lot]) -> str:
+            totals: Counter[str] = Counter()
+            for lot in lots:
+                totals[lot.product] += lot.quantity
+            return ", ".join(
+                f"{totals[product]:.0f} {LOT_UNITS[product]}"
+                for product in sorted(totals)
+            )
+
+        details = f"Granja {farm_id}: {len(recalled)} lote(s) recolhido(s)"
+        if recalled:
+            details += f" ({amounts(recalled)})"
+        if outside:
+            details += (
+                f"; {len(outside)} lote(s) exposto(s) fora da janela de "
+                f"{self.params.trace_window_days} dias ({amounts(outside)})"
+            )
+        self.log_event("RECOLHIMENTO_LOTES", details, farm_id=farm_id)
+
+    def lot_summary(self) -> dict[str, dict[str, object]]:
+        """Cumulative lot tallies per product (see ``LOT_TALLIES``).
+
+        `mean_exposure_days` averages recall day minus collection day over
+        exposed recalled lots; None until one is recalled.
+        """
+        summary: dict[str, dict[str, object]] = {}
+        for product in HUB_PRODUCTS.values():
+            exposed_recalled = self._lot_counts[product, "exposed_recalled"]
+            summary[product] = {
+                **{
+                    tally: {
+                        "lots": self._lot_counts[product, tally],
+                        "quantity": float(self._lot_quantities[product, tally]),
+                    }
+                    for tally in LOT_TALLIES
+                },
+                "mean_exposure_days": self._exposure_days[product] / exposed_recalled
+                if exposed_recalled
+                else None,
+            }
+        return summary
+
     def _record_history(self) -> None:
         today = self.day_count
         statuses = Counter(farm.status for farm in self.farms)
@@ -954,6 +1094,7 @@ class AgentModel(WorldModel):
                 "introductions": {
                     kind: todays_kinds[kind] for kind in INTRODUCTION_EVENTS
                 },
+                "lots": self.lot_summary(),
             }
         )
 

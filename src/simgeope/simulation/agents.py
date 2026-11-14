@@ -154,6 +154,37 @@ EGG_HUB_KIND = "egg_grading"
 LAYER_FARM_KIND = "farm_layer"  # postura
 BROILER_FARM_KIND = "farm_broiler"  # corte
 FARM_PRODUCTION = {LAYER_FARM_KIND: "postura", BROILER_FARM_KIND: "corte"}
+# Product collected at farms by trucks of each product hub kind.
+HUB_PRODUCTS = {SLAUGHTER_HUB_KIND: "aves", EGG_HUB_KIND: "ovos"}
+EGGS_PER_DOZEN = 12
+
+
+@dataclass(frozen=True, slots=True)
+class Lot:
+    """One product load collected at a farm by a product fleet (HUB_PRODUCTS).
+
+    `quantity` is in dozens for "ovos" and birds for "aves". `farm_status` is
+    the farm's ``FarmAgent.status`` before the visit: "hidden" means it left
+    an infected, not yet notified farm (an exposed lot). When its farm is
+    traced, the model replaces the lot with a copy whose `trace` is
+    "recalled" or, for an exposed lot collected before the trace window,
+    "outside_window", and `trace_day` the day of that trace; other lots keep
+    None.
+    """
+
+    day: int
+    farm_id: str
+    hub_id: str
+    truck_id: str
+    product: str
+    quantity: float
+    farm_status: str
+    trace: str | None = None
+    trace_day: int | None = None
+
+    @property
+    def exposed(self) -> bool:
+        return self.farm_status == "hidden"
 
 
 class FarmAgent(Agent):
@@ -201,6 +232,9 @@ class FarmAgent(Agent):
         # This infection's detection day was brought forward by active
         # surveillance in the farm's zone.
         self.surveillance_detection: bool = False
+
+        # Eggs laid since this day leave with the next egg-truck collection.
+        self.last_egg_collection_day: int = model.day_count
 
         model.agents_by_id[farm_id] = self
 
@@ -736,6 +770,9 @@ class TruckAgent(Agent):
         # Official protocol: disinfection at the emergency-area perimeter...
         if protocol and (self.position.zone is None) != (stop.zone is None):
             self._zone_disinfection()
+        if isinstance(stop, FarmAgent):
+            # Before the fomite exchange: the product predates this visit.
+            self._collect(stop)
         load_on_arrival = self.load
         introduced = (
             self._exchange_at_farm(stop)
@@ -757,6 +794,38 @@ class TruckAgent(Agent):
             )
         )
         self.position = stop
+
+    def _collect(self, farm: FarmAgent) -> None:
+        """Record the lot a product truck takes from `farm`, if any.
+
+        Eggs: what the live hens laid since the last egg collection, at the
+        flock size of today (laying drop in sick hens is not modelled).
+        Birds: a fixed load per visit, capped by the live flock.
+        """
+        product = HUB_PRODUCTS.get(self.base.kind)
+        if product is None:
+            return
+        p = self.model.params
+        today = self.model.day_count
+        alive = farm.susceptible + farm.exposed + farm.infected + farm.recovered
+        if product == "ovos":
+            days = today - farm.last_egg_collection_day
+            farm.last_egg_collection_day = today
+            quantity = alive * p.eggs_per_hen_day * days / EGGS_PER_DOZEN
+        else:
+            quantity = min(float(p.broiler_lot_birds), alive)
+        if quantity > 0:
+            self.model.record_lot(
+                Lot(
+                    day=today,
+                    farm_id=farm.farm_id,
+                    hub_id=self.base.hub_id,
+                    truck_id=self.truck_id,
+                    product=product,
+                    quantity=quantity,
+                    farm_status=farm.status,
+                )
+            )
 
     def _exchange_at_farm(self, farm: FarmAgent) -> bool:
         p = self.model.params

@@ -37,6 +37,7 @@
         <div class="kpi" id="kpi-notified"><span class="kpi-label"><i class="mk mk-notified"></i>Notificadas</span><span class="kpi-value">—</span><span class="kpi-note"></span></div>
         <div class="kpi" id="kpi-quarantined"><span class="kpi-label"><i class="mk mk-quarantined"></i>Em quarentena</span><span class="kpi-value">—</span><span class="kpi-note"></span></div>
         <div class="kpi" id="kpi-culled"><span class="kpi-label"><i class="mk mk-culled"></i>Sacrificadas</span><span class="kpi-value">—</span><span class="kpi-note"></span></div>
+        <div class="kpi" id="kpi-restocked"><span class="kpi-label"><i class="mk mk-restocked"></i>Repovoadas</span><span class="kpi-value">—</span><span class="kpi-note"></span></div>
       </div>
       <div class="seg-bar" id="status-ribbon"></div>
     </div>
@@ -54,6 +55,7 @@
       <section class="rail-section" aria-labelledby="playback-title">
         <h2 id="playback-title">Reprodução</h2>
         <p class="playback-now"><strong id="playback-day">Dia —</strong> <span id="playback-mode" data-state="live">ao vivo</span></p>
+        <p class="playback-date" id="playback-date"></p>
         <div class="button-row">
           <button type="button" id="sim-step" title="Atalho: seta para a direita">Passo</button>
           <button type="button" id="sim-run" aria-pressed="false" title="Atalho: barra de espaço">Rodar</button>
@@ -89,8 +91,19 @@
               <li><i class="mk mk-hidden"></i>Infectada oculta</li>
               <li><i class="mk mk-notified"></i>Notificada</li>
               <li><i class="mk mk-culled"></i>Sacrificada</li>
+              <li><i class="mk mk-restocked"></i>Repovoada (parcial, em monitoramento)</li>
               <li id="legend-focus" hidden><i class="mk-focus"></i>Foco confirmado</li>
             </ul>
+            <ul class="legend">
+              <li><i class="mk-type"></i>Corte</li>
+              <li><i class="mk-type postura"></i>Postura (centro vazado)</li>
+            </ul>
+            <fieldset class="segmented small">
+              <legend>Mostrar granjas</legend>
+              <label><input type="radio" name="farm-type" value="" checked><span>Todas</span></label>
+              <label><input type="radio" name="farm-type" value="postura"><span>Postura</span></label>
+              <label><input type="radio" name="farm-type" value="corte"><span>Corte</span></label>
+            </fieldset>
           </li>
           <li id="zones-layer" hidden>
             <label class="toggle"><input type="checkbox" data-layer="simZones" checked>Zonas de emergência</label>
@@ -103,8 +116,8 @@
             <p class="legend-note" id="zones-note">Raios em linha reta a partir de cada foco.</p>
           </li>
           <li>
-            <label class="toggle"><input type="checkbox" data-layer="simHubs" checked>Bases (fábricas e abatedouros)</label>
-            <p class="legend-note">Tamanho e cor pela carga de fômite</p>
+            <label class="toggle"><input type="checkbox" data-layer="simHubs" checked>Bases (fábricas, abatedouros, entrepostos)</label>
+            <p class="legend-note">Tamanho e cor pela carga de fômite. Clique numa base para ver os lotes recebidos.</p>
             <div class="ramp-legend"><i class="mk-hub"></i><div class="ramp-block"><span class="ramp fomite"></span><span class="ramp-ends"><span>0%</span><span>100%</span></span></div></div>
           </li>
           <li>
@@ -144,8 +157,13 @@
             <ul class="legend">
               <li><i class="ring" style="--c: var(--pw-birds)"></i>Bando com ave infectada</li>
               <li><i class="ring thin" style="--c: var(--bird-s)"></i>Bando sem infecção</li>
+              <li><i class="ring thin site" style="--c: var(--bird-s)"></i>Pousou num sítio conhecido</li>
             </ul>
-            <p class="legend-note">Últimos 7 dias até o dia exibido. Tamanho pelo número de aves; mais apagado, chegada mais antiga.</p>
+            <p class="legend-note">Últimos 7 dias até o dia exibido. Tamanho pelo número de aves; mais apagado, chegada mais antiga. Clique num bando para detalhes.</p>
+            <figure class="month-profile" id="arrival-profile" hidden>
+              <figcaption class="legend-note">Chegadas por mês, em relação ao mês de pico; destacado o mês do dia exibido.</figcaption>
+              <div class="month-bars" id="arrival-profile-bars"></div>
+            </figure>
           </li>
           <li>
             <label class="toggle"><input type="checkbox" data-layer="simHeat">Zona de calor</label>
@@ -274,6 +292,7 @@
               <li><i class="key key-box" style="--c: var(--st-hidden)"></i>Ocultas</li>
               <li><i class="key key-box" style="--c: var(--st-notified)"></i>Notificadas</li>
               <li><i class="key key-box" style="--c: var(--st-culled)"></i>Sacrificadas</li>
+              <li><i class="key key-box" style="--c: var(--st-restocked)"></i>Repovoadas</li>
             </ul>
           </figcaption>
           <svg id="chart-status" role="img" aria-label="Granjas por situação"></svg>
@@ -314,6 +333,30 @@
           </figcaption>
           <ol class="rank-bars" id="hub-chain-bars" aria-label="Introduções por caminhão por base"></ol>
         </figure>
+        <figure class="chart markets" aria-labelledby="markets-title">
+          <figcaption>
+            <h3 id="markets-title">Produção e mercados</h3>
+            <p class="legend-note" id="markets-note"></p>
+          </figcaption>
+          <div class="table-scroll" id="markets-table"></div>
+          <p class="legend-note">O modelo mede quanto produto saiu de granjas infectadas e quanto foi recolhido; não estima infecção de pessoas pelo consumo.</p>
+        </figure>
+        <figure class="chart">
+          <figcaption>
+            <h3>Lotes expostos e recolhidos (acumulado)</h3>
+            <ul class="legend">
+              <li><i class="key key-line" style="--c: var(--st-hidden)"></i>Expostos</li>
+              <li><i class="key key-line" style="--c: var(--series-neutral)"></i>Expostos recolhidos</li>
+            </ul>
+          </figcaption>
+          <svg id="chart-lots" role="img" aria-label="Lotes expostos e recolhidos"></svg>
+          <output class="readout" id="readout-lots"></output>
+        </figure>
+        <details class="chart markets-hubs" id="markets-hubs">
+          <summary>Lotes expostos por entreposto e abatedouro</summary>
+          <p class="legend-note" id="markets-hubs-note"></p>
+          <ol class="rank-bars" id="markets-hubs-bars" aria-label="Lotes expostos por base de destino"></ol>
+        </details>
         <figure class="chart">
           <figcaption><h3>Custo acumulado</h3></figcaption>
           <svg id="chart-cost" role="img" aria-label="Custo acumulado"></svg>

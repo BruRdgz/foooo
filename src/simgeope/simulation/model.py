@@ -22,6 +22,7 @@ from simgeope.world.exceptions import NoRoadNearbyError, WorldDataMissingError
 from simgeope.world.facilities import Facility, FacilityIndex, snap_facility
 
 from .agents import (
+    CLINICAL_SIGNS_MIN_BIRDS,
     FARM_STATUSES,
     ZONE_RINGS,
     BirdAgent,
@@ -640,6 +641,7 @@ class AgentModel(WorldModel):
         for f in self.farms:
             f.try_quarantine()
             f.try_release_quarantine()
+            f.try_restock()
 
         self._update_economic_cost()
         self._update_rt()
@@ -804,32 +806,46 @@ class AgentModel(WorldModel):
                     share=share,
                 )
 
-    # --------------------------------------------- official protocol (POP)
+    # ------------------------------------ official protocol (POP and Plano)
     def _active_surveillance(self) -> None:
-        """Bring forward the detection of infections in perifoco/vigilância.
+        """Today's inspections, which notify farms showing clinical signs.
 
-        A surveillance visit finds an infected farm at most the ring's
-        ``*_detection_days`` after it entered the ring or got infected,
-        whichever is later (an infection that starts after the farm entered
-        is found within that many days of starting, not retroactively).
-        The day drawn at infection is kept when it is earlier.
+        Every farm in the perifoco or vigilância is inspected each
+        ``perifocus_detection_days``/``surveillance_detection_days`` after
+        entering its ring, and a restocked farm each
+        ``restock_inspection_days`` after restocking (Plano de Contingência
+        IAAP/DNC §7.2-7.3 and §11). Inspections sample only birds with
+        clinical signs, so they find an infection once at least
+        ``CLINICAL_SIGNS_MIN_BIRDS`` are infectious. A finding brings the
+        detection day forward to today; an earlier drawn day is kept.
         """
         p = self.params
-        deadlines = {
+        intervals = {
             "perifoco": p.perifocus_detection_days,
             "vigilancia": p.surveillance_detection_days,
         }
         today = self.day_count
         for farm in self.farms:
-            days = deadlines.get(farm.zone)
-            if days is None or farm.culled or farm.notified:
+            if (
+                farm.culled
+                or farm.notified
+                or farm.first_infection_day < 0
+                or farm.infected < CLINICAL_SIGNS_MIN_BIRDS
+                or farm.detection_day <= today
+            ):
                 continue
-            if farm.first_infection_day < 0:
-                continue
-            visit = max(farm.zone_since, farm.first_infection_day) + days
-            visit = max(visit, today)
-            if visit < farm.detection_day:
-                farm.detection_day = visit
+            # (start day, interval): the first inspection is one interval
+            # after the farm entered its ring or was restocked.
+            schedules = []
+            if farm.zone in intervals:
+                schedules.append((farm.zone_since, intervals[farm.zone]))
+            if farm.restocked:
+                schedules.append((farm.restock_day, p.restock_inspection_days))
+            if any(
+                today > start and (today - start) % interval == 0
+                for start, interval in schedules
+            ):
+                farm.detection_day = today
                 farm.surveillance_detection = True
 
     def _update_protocol(self, newly_notified: Sequence[FarmAgent]) -> None:
@@ -841,10 +857,11 @@ class AgentModel(WorldModel):
         today = self.day_count
         for farm in newly_notified:
             if farm.surveillance_detection:
+                where = farm.zone or "monitoramento do repovoamento"
                 self.log_event(
                     "VIGILANCIA_ATIVA",
                     f"Granja {farm.farm_id}: infecção encontrada pela vigilância "
-                    f"ativa ({farm.zone})",
+                    f"ativa ({where})",
                     farm_id=farm.farm_id,
                 )
             # Kept even if the infection ends first: the samples were taken.

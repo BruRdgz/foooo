@@ -151,21 +151,29 @@ def test_param_schema_covers_every_scalar_model_parameter(client):
         "Fômites (caminhões)",
         "Camada de risco",
         "Intervenções e economia",
-        "Protocolo oficial (MAPA POP 2023)",
+        "Protocolo oficial (MAPA 2023)",
     ]
     # Every entry says whether its value is an assumption and where it comes
-    # from; protocol values are cited or flagged as assumptions.
+    # from. Protocol values, and any other value with a source, are cited from
+    # an official MAPA document or flagged as assumptions; only the mortality
+    # suspicion of the surveillance group cites one outside the protocol.
+    official = ("POP", "Plano de Contingência", "Ficha Técnica", "planilha MAPA")
+    cited = {
+        "mortality_notification",
+        "mortality_alert_pct",
+        "mortality_alert_window_days",
+    }
     for spec in body["schema"]:
         assert type(spec["assumption"]) is bool
-        if spec["group"] != groups[-1]:
+        if spec["group"] != groups[-1] and spec["name"] not in cited:
             assert (spec["assumption"], spec["source"]) == (False, None)
         elif spec["assumption"]:
             assert spec["source"].startswith("suposição: ")
         else:
-            assert spec["source"] and "POP" in spec["source"]
+            assert any(name in spec["source"] for name in official)
     protocol = {s["name"]: s for s in body["schema"] if s["group"] == groups[-1]}
-    assert not protocol["perifocus_radius_km"]["assumption"]
-    assert protocol["surveillance_radius_km"]["assumption"]
+    assert not protocol["surveillance_radius_km"]["assumption"]
+    assert protocol["zone_release_days"]["assumption"]
 
 
 def test_reset_param_overrides_persist_across_resets(client, session):
@@ -543,7 +551,7 @@ def test_presets_are_valid_overrides_applied_by_reset(client, session):
     # The sustained outbreak plus the protocol table's values.
     assert official["values"] == by_id["surto_sustentado"]["values"] | {
         "protocol_enabled": 1,
-        "confirmation_days": 2,
+        "confirmation_days": 4,
         "auto_depopulation": 1,
         "perifocus_radius_km": 3.0,
         "surveillance_radius_km": 10.0,
@@ -553,6 +561,10 @@ def test_presets_are_valid_overrides_applied_by_reset(client, session):
         "zone_release_days": 28,
         "perifocus_detection_days": 3,
         "surveillance_detection_days": 7,
+        "fallow_days": 30,
+        "restock_pct": 20.0,
+        "restock_monitoring_days": 60,
+        "restock_inspection_days": 7,
     }
     for preset in presets:
         assert preset["label"] and preset["description"]

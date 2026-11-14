@@ -11,6 +11,7 @@ Mesa 3.x: `self.random` is a stdlib `random.Random`; `model.rng` is NumPy's.
 from __future__ import annotations
 
 import math
+from collections import deque
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -86,6 +87,11 @@ def local_spread_prob(
 # The continuous SEIR tail never reaches zero; below one bird incubating or
 # infectious the outbreak inside the farm is over.
 EXTINCTION_THRESHOLD_BIRDS = 1.0
+# Inspections only sample birds with clinical signs (Plano de Contingência
+# IAAP/DNC, §7): the SEIR's infectious birds, not the incubating ones. One bird
+# is the fewest an inspection could find; an optimistic guess, since one sick
+# bird among thousands can be missed.
+CLINICAL_SIGNS_MIN_BIRDS = 1.0
 
 
 def fomite_introduction_prob(params, *, load: float, biosecurity: float) -> float:
@@ -140,8 +146,17 @@ class FomiteSource(NamedTuple):
 
 # ==================================================================== FARM
 
-# Every value of ``FarmAgent.status``.
-FARM_STATUSES = ("healthy", "quarantined", "hidden", "notified", "culled")
+# Every value of ``FarmAgent.status``. "culled" farms are empty (until restocked,
+# with the official protocol); "restocked" ones hold a partial flock under
+# monitoring after a cull.
+FARM_STATUSES = (
+    "healthy",
+    "quarantined",
+    "hidden",
+    "notified",
+    "culled",
+    "restocked",
+)
 # Emergency-area rings of the official protocol, most restrictive first.
 ZONE_RINGS = ("perifoco", "vigilancia", "protecao")
 # Rings where every truck stop is followed by vehicle disinfection.
@@ -172,13 +187,19 @@ class FarmAgent(Agent):
         self.facility = facility
         self.pop_total = pop_total
 
-        # SEIR
+        # SEIR. `housed` is the current flock's size, the SEIR's N: the farm's
+        # capacity `pop_total`, or less during a partial restocking.
+        self.housed: int = pop_total
         self.susceptible: float = float(pop_total)
         self.exposed: float = 0.0
         self.infected: float = 0.0
         self.recovered: float = 0.0
         self.dead: float = 0.0
         self.new_exposed_today: float = 0.0
+        # Deaths of the last days, newest last, for the mortality suspicion.
+        self.recent_deaths: deque[float] = deque(
+            maxlen=model.params.mortality_alert_window_days
+        )
 
         # surveillance / intervention
         self.biosecurity: float = float(model.params.base_biosecurity)
@@ -189,8 +210,13 @@ class FarmAgent(Agent):
         self.quarantined: bool = False
         self.quarantine_day: int = -1
         self.infection_end_day: int = -1
+        # Empty since the last cull, `cull_day`; with the official protocol it
+        # is restocked after the fallow (see try_restock).
         self.culled: bool = False
         self.cull_day: int = -1
+        # Holding a partial flock under monitoring since `restock_day`.
+        self.restocked: bool = False
+        self.restock_day: int = -1
         self.under_biosec_boost: bool = False
 
         # official protocol, set by the model at the end of each day
@@ -198,8 +224,8 @@ class FarmAgent(Agent):
         self.zone_since: int = -1  # day `zone` took its current value
         self.focus: bool = False  # an active confirmed focus
         self.standstill: bool = False  # inside a focus's initial standstill
-        # This infection's detection day was brought forward by active
-        # surveillance in the farm's zone.
+        # This infection's detection day was brought forward by an active
+        # surveillance inspection (in the farm's zone or of its restocking).
         self.surveillance_detection: bool = False
 
         model.agents_by_id[farm_id] = self
@@ -233,7 +259,9 @@ class FarmAgent(Agent):
             return "culled"
         if self.infected > 0 or self.exposed > 0:
             return "notified" if self.notified else "hidden"
-        return "quarantined" if self.quarantined else "healthy"
+        if self.quarantined:
+            return "quarantined"
+        return "restocked" if self.restocked else "healthy"
 
     def shedding(self) -> float:
         """Virus shedding in [0, 1], saturating at ``fomite_full_load_prevalence``.
@@ -241,18 +269,18 @@ class FarmAgent(Agent):
         It is the load a visiting truck picks up and the strength of this farm
         as a source of local or wild-bird spread.
         """
-        if self.pop_total <= 0 or self.infected <= 0:
+        if self.housed <= 0 or self.infected <= 0:
             return 0.0
-        prevalence = self.infected / self.pop_total
+        prevalence = self.infected / self.housed
         return min(1.0, prevalence / self.model.params.fomite_full_load_prevalence)
 
     # ---------------------------------------------------------- SEIR step
     def step_intra_farm(self) -> None:
-        if self.culled or self.pop_total <= 0:
+        if self.culled or self.housed <= 0:
             return
 
         p = self.model.params
-        n = self.pop_total
+        n = self.housed
         beta_eff = p.beta * (1.0 - self.biosecurity / 100.0)
         sigma = 1.0 / p.incubation_days
         gamma = 1.0 / p.infectious_period_days
@@ -268,6 +296,7 @@ class FarmAgent(Agent):
         self.infected += new_inf - leaving
         self.recovered += new_rec
         self.dead += new_dead
+        self.recent_deaths.append(new_dead)
 
         self.new_exposed_today += new_exp
         self.model.total_infections += new_exp
@@ -359,19 +388,46 @@ class FarmAgent(Agent):
         )
 
     # --------------------------------------------------- vigilância
+    def mortality_alert(self) -> bool:
+        """Whether recent deaths make this a suspected case (Ficha Técnica IA).
+
+        Deaths over the last ``mortality_alert_window_days`` days, today
+        included, reach ``mortality_alert_pct`` of the housed flock.
+        """
+        p = self.model.params
+        return (
+            bool(p.mortality_notification)
+            and self.housed > 0
+            and math.fsum(self.recent_deaths)
+            >= p.mortality_alert_pct / 100.0 * self.housed
+        )
+
     def try_notify(self) -> None:
+        """Notify on the detection day or a mortality alert, whichever is first.
+
+        A mortality alert brings ``detection_day`` forward to today.
+        """
         if self.notified or self.first_infection_day < 0:
             return
         if self.infected <= 0 and self.exposed <= 0:
             return
-        if self.model.day_count >= self.detection_day:
+        p = self.model.params
+        today = self.model.day_count
+        by_mortality = today < self.detection_day and self.mortality_alert()
+        if by_mortality:
+            self.detection_day = today
+        if today >= self.detection_day:
             self.notified = True
-            self.reaction_day = self.model.day_count + self.random.randint(
-                0, self.model.params.reaction_time_max
+            self.reaction_day = today + self.random.randint(0, p.reaction_time_max)
+            reason = (
+                f" (mortalidade de {p.mortality_alert_pct:g}% em "
+                f"{p.mortality_alert_window_days} dias)"
+                if by_mortality
+                else ""
             )
             self.model.log_event(
                 "DETECCAO",
-                f"Granja {self.farm_id} notificada às autoridades",
+                f"Granja {self.farm_id} notificada às autoridades{reason}",
                 farm_id=self.farm_id,
             )
 
@@ -405,21 +461,86 @@ class FarmAgent(Agent):
                 farm_id=self.farm_id,
             )
 
+    # ------------------------------------------------ restocking (protocol)
+    def try_restock(self) -> None:
+        """Official protocol after a cull (Plano de Contingência IAAP/DNC §10-11).
+
+        After ``fallow_days`` empty, the farm gets a new flock of
+        ``restock_pct`` of its capacity, its quarantine is lifted and it is
+        inspected every ``restock_inspection_days`` (see the model's active
+        surveillance). ``restock_monitoring_days`` later, once it is not
+        notified, it is filled to capacity. Without the protocol a cull stays
+        final, as in the NetLogo model.
+        """
+        p = self.model.params
+        if not p.protocol_enabled:
+            return
+        today = self.model.day_count
+        if self.culled and today >= self.cull_day + p.fallow_days:
+            self._new_flock(round(self.pop_total * p.restock_pct / 100.0))
+            self.culled = self.quarantined = False
+            self.restocked, self.restock_day = True, today
+            self.model.log_event(
+                "REPOVOAMENTO",
+                f"Granja {self.farm_id}: repovoada com {self.housed} aves "
+                f"({p.restock_pct:g}% da capacidade), em monitoramento por "
+                f"{p.restock_monitoring_days} dias",
+                farm_id=self.farm_id,
+            )
+        elif (
+            self.restocked
+            and not self.notified
+            and today >= self.restock_day + p.restock_monitoring_days
+        ):
+            self.susceptible += self.pop_total - self.housed
+            self.housed = self.pop_total
+            self.restocked = False
+            self.model.log_event(
+                "REPOVOAMENTO_TOTAL",
+                f"Granja {self.farm_id}: repovoamento total ({self.pop_total} aves)",
+                farm_id=self.farm_id,
+            )
+
+    def _new_flock(self, size: int) -> None:
+        """Replace the empty farm's flock with `size` susceptible birds.
+
+        The new flock has its own outbreak clock and death record.
+        """
+        self.housed = size
+        self.susceptible = float(size)
+        self.exposed = self.infected = self.recovered = self.dead = 0.0
+        self.recent_deaths.clear()
+        self.first_infection_day = self.detection_day = self.reaction_day = -1
+        self.notified = False
+        self.surveillance_detection = False
+
     # ---------------------------------------------------- interventions
     def _cull(self) -> float:
         """Cull every living bird, paying for each; returns how many."""
         p = self.model.params
-        cull_count = self.susceptible + self.exposed + self.infected
+        cull_count = self.susceptible + self.exposed + self.infected + self.recovered
         self.model.cumulative_cost += cull_count * p.cull_cost_per_bird
         self.model.total_culled += cull_count
 
         self.susceptible = 0.0
         self.exposed = 0.0
         self.infected = 0.0
+        self.recovered = 0.0
         self.culled = True
+        self.restocked = False
         self.cull_day = self.model.day_count
         self.start_quarantine()
         return cull_count
+
+    def _log_fallow(self) -> None:
+        p = self.model.params
+        if p.protocol_enabled:
+            self.model.log_event(
+                "VAZIO_SANITARIO",
+                f"Granja {self.farm_id}: vazio sanitário de {p.fallow_days} dias, "
+                f"repovoamento a partir do dia {self.cull_day + p.fallow_days}",
+                farm_id=self.farm_id,
+            )
 
     def depopulate(self) -> None:
         """Depopulate a confirmed focus (official protocol), sparing neighbours."""
@@ -430,6 +551,7 @@ class FarmAgent(Agent):
             "sacrificadas",
             farm_id=self.farm_id,
         )
+        self._log_fallow()
 
     def apply_stamping_out(self) -> None:
         p = self.model.params
@@ -439,6 +561,7 @@ class FarmAgent(Agent):
             f"Granja {self.farm_id}: {cull_count:.0f} aves sacrificadas",
             farm_id=self.farm_id,
         )
+        self._log_fallow()
 
         for other in self.model.farms_near(self, p.stamping_out_radius_km):
             if other is self or other.culled:

@@ -341,17 +341,20 @@ def test_farm_zone_is_most_restrictive_ring_over_active_foci(tiny_world):
 
 
 @pytest.mark.parametrize(
-    "lon,infected_day,drawn_delay,detected_day,by_surveillance",
+    "lon,infected_day,seed,drawn_delay,detected_day,by_surveillance",
     [
-        (-34.996, 1, 20, 4, True),  # perifoco: 3 days after entering
-        (-34.996, 10, 20, 13, True),  # infected after entering: 3 days later
-        (-34.9925, 1, 20, 8, True),  # vigilância: 7 days
-        (-34.996, 1, 2, 3, False),  # the drawn day comes first
-        (-34.99, 1, 6, 7, False),  # proteção: no active surveillance
+        (-34.996, 1, 10, 20, 4, True),  # perifoco: visits on days 4, 7, 10...
+        (-34.996, 10, 10, 20, 13, True),  # infected after entering: next visit
+        # Only 0.5 infectious birds at the day-4 visit (the rest incubating):
+        # found at the next visit, with 1.3.
+        (-34.996, 3, 2, 20, 7, True),
+        (-34.9925, 1, 10, 20, 8, True),  # vigilância: every 7 days
+        (-34.996, 1, 10, 2, 3, False),  # the drawn day comes first
+        (-34.99, 1, 10, 6, 7, False),  # proteção: no active surveillance
     ],
 )
-def test_active_surveillance_caps_detection_in_perifoco_and_vigilancia(
-    tiny_world, lon, infected_day, drawn_delay, detected_day, by_surveillance
+def test_periodic_active_surveillance_in_perifoco_and_vigilancia(
+    tiny_world, lon, infected_day, seed, drawn_delay, detected_day, by_surveillance
 ):
     from simgeope.simulation.model import Focus
 
@@ -368,7 +371,7 @@ def test_active_surveillance_caps_detection_in_perifoco_and_vigilancia(
     assert farm.zone_since == 1
     while model.day_count < infected_day:
         model.step()
-    farm.seed_from_external(10, "INTRODUCAO_INICIAL")
+    farm.seed_from_external(seed, "INTRODUCAO_INICIAL")
     farm.detection_day = infected_day + drawn_delay
 
     while not farm.notified:
@@ -417,3 +420,141 @@ def test_emergency_area_is_released_after_zone_release_days(
     assert focus.release_day == release
     # Active on days 1 .. release - 1, by the zones set at the end of each day.
     assert zones == ["protecao"] * (release - 1) + [None] * (8 - release)
+
+
+@pytest.mark.parametrize(
+    "notification,pct,window,housed,notified_day",
+    [
+        # Deaths per day: 90, 60, 40, 26.7... (300 infectious, none exposed).
+        (1, 10.0, 3, 1000, 2),  # 90 + 60 >= 100
+        (1, 5.0, 1, 1000, 1),
+        (1, 10.0, 1, 1000, 5),  # no single day reaches 100: drawn day
+        (1, 19.0, 2, 1000, 5),  # 190 dead by day 3, but never within 2 days
+        (1, 10.0, 3, 500, 1),  # the threshold is a share of the housed flock
+        (0, 5.0, 1, 1000, 5),  # rule off
+    ],
+)
+def test_mortality_over_window_notifies_before_drawn_day(
+    tiny_world, notification, pct, window, housed, notified_day
+):
+    model = _model(
+        tiny_world,
+        mortality_notification=notification,
+        mortality_alert_pct=pct,
+        mortality_alert_window_days=window,
+        mortality_rate=90.0,
+        infectious_period_days=3.0,
+    )
+    farm = model.add_farm(Facility("farm", "farm", -35, -8), pop_total=1000)
+    farm.biosecurity = 100.0  # no new exposures
+    farm.housed = housed
+    farm.susceptible, farm.infected = housed - 300.0, 300.0
+    farm.first_infection_day, farm.detection_day = 0, 5
+
+    while not farm.notified:
+        model.step()
+
+    assert model.day_count == farm.detection_day == notified_day
+    (detection,) = [e for e in model.events if e.kind == "DETECCAO"]
+    assert ("mortalidade" in detection.details) is (notified_day < 5)
+
+
+@pytest.mark.parametrize(
+    "protocol,statuses,housed",
+    [
+        # Culled on day 1; 2-day fallow, then 20% for 3 days, then full.
+        (
+            1,
+            ["culled"] * 2 + ["restocked"] * 3 + ["healthy"] * 2,
+            [100, 100, 20, 20, 20, 100, 100],
+        ),
+        (0, ["culled"] * 7, [100] * 7),  # without the protocol a cull is final
+    ],
+)
+def test_culled_farm_is_restocked_after_fallow_then_filled(
+    tiny_world, protocol, statuses, housed
+):
+    model = _model(
+        tiny_world,
+        **PROTOCOL | {"protocol_enabled": protocol},
+        fallow_days=2,
+        restock_pct=20.0,
+        restock_monitoring_days=3,
+    )
+    farm = model.add_farm(Facility("farm", "farm", -35, -8), pop_total=100)
+    farm.susceptible, farm.recovered = 90.0, 10.0
+
+    seen = []
+    for day in range(1, 8):
+        model.step()
+        if day == 1:
+            farm.apply_stamping_out()
+        seen.append((farm.status, farm.housed, farm.susceptible))
+
+    assert model.total_culled == 100.0  # recovered birds are culled too
+    assert [s for s, _, _ in seen] == statuses
+    assert [h for _, h, _ in seen] == housed
+    assert all(s == (0 if st == "culled" else h) for st, h, s in seen)
+    lifecycle = [
+        (e.day, e.kind)
+        for e in model.events
+        if e.kind
+        in {
+            "SACRIFICIO_SANITARIO",
+            "VAZIO_SANITARIO",
+            "REPOVOAMENTO",
+            "REPOVOAMENTO_TOTAL",
+        }
+    ]
+    assert lifecycle == [(1, "SACRIFICIO_SANITARIO")] + (
+        [(1, "VAZIO_SANITARIO"), (3, "REPOVOAMENTO"), (6, "REPOVOAMENTO_TOTAL")]
+        if protocol
+        else []
+    )
+
+
+def test_restocked_focus_is_inspected_and_becomes_a_focus_again(tiny_world):
+    model = _model(
+        tiny_world,
+        **PROTOCOL,
+        confirmation_days=0,
+        zone_release_days=0,  # no rings: only the restocking inspections
+        fallow_days=1,
+        restock_pct=50.0,
+        restock_monitoring_days=30,
+        restock_inspection_days=3,
+    )
+    farm = model.add_farm(Facility("farm", "farm", -35, -8), pop_total=1000)
+    farm.susceptible, farm.exposed = 900.0, 100.0
+    farm.first_infection_day, farm.detection_day = 0, 1
+
+    model.step()  # notified, confirmed and depopulated
+    model.step()  # restocked with 500 birds, a new outbreak clock
+    assert (farm.status, farm.housed, farm.notified) == ("restocked", 500, False)
+    farm.seed_from_external(10, "INTRODUCAO_INICIAL")
+    farm.detection_day = 50
+    for _ in range(3):
+        model.step()
+
+    kinds = {
+        "DETECCAO",
+        "VIGILANCIA_ATIVA",
+        "FOCO_CONFIRMADO",
+        "DESPOVOAMENTO",
+        "VAZIO_SANITARIO",
+        "REPOVOAMENTO",
+    }
+    events = [(e.day, e.kind) for e in model.events if e.kind in kinds]
+    again = ["DETECCAO", "FOCO_CONFIRMADO", "DESPOVOAMENTO", "VAZIO_SANITARIO"]
+    assert events == [
+        *((1, kind) for kind in again),
+        (2, "REPOVOAMENTO"),
+        # First inspection, 3 days after restocking.
+        (5, "DETECCAO"),
+        (5, "VIGILANCIA_ATIVA"),
+        *((5, kind) for kind in again[1:]),
+    ]
+    (found,) = [e for e in model.events if e.kind == "VIGILANCIA_ATIVA"]
+    assert "repovoamento" in found.details
+    assert [f.farm_id for f in model.foci] == ["farm", "farm"]
+    assert (farm.status, farm.cull_day) == ("culled", 5)

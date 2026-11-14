@@ -145,12 +145,10 @@ a tabela 74 fica só como coluna de conferência.
 - **Escala**: com ~215–256 mil aves por granja (antes 5.000), o custo de
   abate (`cull_cost_per_bird` × aves) passa a dominar o custo acumulado, e
   uma granja precisa de mais aves infectadas para carregar um caminhão por
-  completo (`fomite_full_load_prevalence` é uma prevalência). Os parâmetros
-  ilustrativos do modelo não foram recalibrados para essa escala. Nas
-  rodadas de 120 dias com as sementes 1–10 no mundo de Pernambuco, o preset
-  "surto_sustentado" manteve ≥ 5 granjas infectadas em 4/10 sementes (antes
-  7/10) e, no "cadeia_logistica", os caminhões causaram 1 de 18 introduções
-  (antes a maioria): os presets precisam ser recalibrados.
+  completo (`fomite_full_load_prevalence` é uma prevalência). Os presets
+  ilustrativos foram recalibrados para essa população no mundo de
+  Pernambuco (sementes 1–20 × 120 dias; números e escolhas no comentário de
+  `PARAM_PRESETS` em `params.py` e em `docs/PROTOCOLO_OFICIAL.md`).
 
 ## Produção e mercados
 
@@ -301,7 +299,11 @@ Fração da taxa de pico (`migratory_flocks_per_day`) aplicada a cada mês.
 | dez | 0,5 | presença de invernada, como jan–mar |
 
 Os meses vêm das fontes; os níveis 0,25 e 0,5 são **suposição** (as fontes dão
-meses de presença, não taxas). O CEMAVE 2019 diz "setembro a maio" para o país;
+meses de presença, não taxas). A taxa de pico padrão, 0,7 bando por dia, também
+é **suposição**: as fontes não dão uma taxa de chegada, então ela mantém o total
+anual da taxa sem sazonalidade usada antes (0,3 por dia o ano todo, cerca de
+110 bandos por ano; com o perfil, 0,7 × 166,75 dias-equivalentes de pico ≈ 117).
+No pico a população migratória fica perto de 0,7 × 8 aves × 30 dias ≈ 170 aves. O CEMAVE 2019 diz "setembro a maio" para o país;
 o modelo segue a fonte de Pernambuco (agosto a abril), e a presença em maio
 vem das aves que chegaram em abril e ainda não partiram.
 

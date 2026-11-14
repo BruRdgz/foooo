@@ -88,24 +88,26 @@ Valores usados no cenário "Protocolo oficial (MAPA)" (`protocolo_mapa`).
 
 ## Efeito medido (ilustrativo, não calibrado)
 
-Mundo de teste: municípios reais de PE (`data/world/pe_v1`) com uma malha
-viária sintética em grade de 3 km a 60 km/h, sem hidrografia; 120 granjas
-sintéticas nos polos do demo, 2 bases por frota. Sementes 1–10 × 120 dias, médias
-por semente. Com a mesma semente os cenários divergem logo no início, então a
-comparação vale pela média e não semente a semente.
+Mundo de Pernambuco (`data/world/pe_environment_v1`, malha viária e hidrografia
+reais) com a população sintética ancorada em dados oficiais
+(`docs/FONTES_DADOS.md`: 267 granjas de cerca de 215 a 256 mil aves, 2 bases por
+frota). Sementes 1–20 × 120 dias a partir de janeiro, com a taxa migratória
+padrão; médias por semente. Com a mesma semente os cenários divergem logo no
+início, então a comparação vale pela média e não semente a semente.
 
 | Cenário | Granjas já infectadas | Ativas no dia 120 (sementes com ≥ 5) | Notificações (por mortalidade) | Focos | Último dia com infecção | Aves mortas | Aves sacrificadas | Repovoamentos (parcial / total) |
 |---|---|---|---|---|---|---|---|---|
-| `surto_sustentado` | 35,0 | 13,2 (5/10) | 34,2 (2,3) | 0 | 92,0 | 136.065 | 0 | — |
-| `surto_sustentado`, `mortality_notification = 0` | 32,6 | 10,5 (6/10) | 31,8 (0) | 0 | 92,0 | 131.087 | 0 | — |
-| `protocolo_mapa` | 6,1 | 0 (0/10) | 6,1 (0,1) | 6,1 | 33,8 | 1.161 | 29.339 | 4,7 / 3,5 |
-| `protocolo_mapa`, `mortality_notification = 0` | 6,1 | 0 (0/10) | 6,1 (0) | 6,1 | 34,0 | 1.229 | 29.271 | 4,7 / 3,5 |
+| `surto_sustentado` | 48,0 | 38,4 (17/20) | 43,4 (0) | 0 | 120 (ativo no fim) | 6.700.085 | 0 | — |
+| `protocolo_mapa` | 3,5 | 0,1 (0/20) | 3,5 (0) | 3,4 | 39,8 | 4.354 | 836.498 | 2,4 / 1,8 |
 
-A regra de mortalidade não encurta os surtos: no `surto_sustentado`, o dia
-sorteado (até 21 dias) quase sempre vem antes de 10% de mortes em 72 h, e com o
-protocolo a vigilância ativa acha as granjas antes disso. Nenhuma granja
-repovoada voltou a ser foco nessas rodadas. Em 4 das 10 sementes o surto morre na
-granja inicial em todos os cenários.
+A regra de mortalidade não mudou nenhuma dessas rodadas: com
+`mortality_notification = 0` os resultados são idênticos. Pelo SEIR do modelo,
+numa granja de 215 a 256 mil aves os 10% de mortes em 72 h só chegam 27 a 34
+dias depois da introdução (15 dias com as 5 mil aves de antes), depois do dia de
+detecção sorteado (até 21 dias); com o protocolo, a vigilância ativa acha as
+granjas antes. A regra só pesa com uma detecção sorteada mais lenta
+(`detection_time_max` acima de cerca de 27). No
+`protocolo_mapa`, em 9 das 20 sementes o surto não passa da granja inicial.
 
 O custo só inclui sacrifício e quarentena: o modelo não precifica a interrupção do
 trânsito, as entregas perdidas, o veículo exclusivo, a desinfecção, as visitas de

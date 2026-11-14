@@ -72,7 +72,7 @@ class ModelParams:
     # time, so the population settles near flocks x size x stay. An infected
     # flock carries one infected index bird. The daily rate is the peak-month
     # rate, scaled by the month's MIGRATORY_ARRIVAL_PROFILE entry (model.py).
-    migratory_flocks_per_day: float = 0.3
+    migratory_flocks_per_day: float = 0.7
     # Share of flocks landing at the documented Pernambuco sites
     # (reference/migracao_sitios_pe.csv); the rest land at size-weighted water.
     migratory_site_fraction: float = 0.5
@@ -353,9 +353,11 @@ PARAM_SPECS: tuple[ParamSpec, ...] = (
         1,
         0.1,
         assumption=True,
-        source="suposição: taxa ilustrativa no mês de pico; o perfil mensal que "
-        "a reduz nos outros meses segue Azevedo Jr. 1992 (Coroa do Avião, "
-        "limícolas árticas de agosto a abril) e CEMAVE (chegada em setembro)",
+        source="suposição: no pico, 0,7 bando por dia mantém o total anual da "
+        "taxa sem sazonalidade usada antes (0,3 por dia o ano todo, cerca de "
+        "110 bandos; agora cerca de 117); o perfil mensal que a reduz nos "
+        "outros meses segue Azevedo Jr. 1992 (Coroa do Avião, limícolas "
+        "árticas de agosto a abril) e CEMAVE (chegada em setembro)",
     ),
     ParamSpec(
         "migratory_site_fraction",
@@ -722,24 +724,23 @@ class ParamPreset:
     values: Mapping[str, float]
 
 
-# Illustrative scenarios, not calibrated. Chosen from 120-day runs of seeds 1-10
-# with the earlier demo population (120 farms of 5,000 birds around the demo
-# poles, 2 hubs per fleet) on a grid-road test world and once on the
-# Pernambuco world: "surto_sustentado" kept >= 5 infected farms at day 120 in
-# 8/10 and 7/10 seeds, and in "cadeia_logistica" trucks caused most farm
-# introductions. Rerun with the mortality suspicion rule (Ficha Técnica IA) on
-# a 3 km road grid over the real municipalities: "surto_sustentado" kept >= 5
-# infected farms at day 120 in 5/10 seeds (6/10 with the rule off); the rule
-# made 2.3 of its 34.2 notifications per run, since the drawn detection day
-# usually comes first. "protocolo_mapa" ended every outbreak before day 120
-# (6.1 foci per run, the last infection on day 33.8 on average).
-# With the official-data population (docs/FONTES_DADOS.md: 267 farms of about
-# 215-256 thousand birds) on the Pernambuco world, "surto_sustentado" gave
-# 4/10, and in "cadeia_logistica" trucks caused 1 of 18 introductions after the
-# initial ones: the presets need recalibrating for that population.
+# Illustrative scenarios, not calibrated against field data. Chosen from
+# 120-day runs of seeds 1-20 on the Pernambuco world (data/world/
+# pe_environment_v1) with the official-data population (docs/FONTES_DADOS.md:
+# 267 farms of about 215-256 thousand birds, 2 hubs per fleet), starting in
+# January with the default migratory rate:
+# - "surto_sustentado" kept >= 5 infected farms at day 120 in 17/20 seeds
+#   (48 farms infected per run, 86% of the later ones by neighbours). Its
+#   local spread reaches 8 km: at 6 km it held in 4/10 seeds.
+# - "protocolo_mapa" (the same plus the protocol) ended every outbreak, the
+#   last infection on day 40 on average (3.4 foci per run).
+# - In "cadeia_logistica" trucks caused 123 of the 182 farm infections after
+#   the initial ones (68%), but infected a farm at all in only 7/20 seeds.
+# The mortality suspicion rule changed none of these runs: a 10% death toll in
+# 72 h comes after the drawn detection day (<= 21) on farms of this size.
 _SUSTAINED_OUTBREAK = {
     "local_spread_prob": 25.0,
-    "local_spread_radius_km": 6.0,
+    "local_spread_radius_km": 8.0,
     "base_biosecurity": 40.0,
     "detection_time_max": 21,
     "infection_prob_truck_to_farm": 40.0,
@@ -749,11 +750,12 @@ PARAM_PRESETS: tuple[ParamPreset, ...] = (
     ParamPreset(
         "surto_sustentado",
         "Surto sustentado",
-        "Valores ilustrativos, não calibrados: transmissão vizinha mais forte e "
-        "de maior alcance, biosseguridade menor e detecção espontânea mais "
-        "lenta mantêm o surto ativo por meses em cerca de metade das sementes. "
-        "A notificação por mortalidade de 10% em 72 h continua valendo, mas "
-        "raramente vem antes.",
+        "Valores ilustrativos, não calibrados com dados de campo: transmissão "
+        "vizinha mais forte e de maior alcance (8 km), biosseguridade menor e "
+        "detecção espontânea mais lenta mantêm 5 ou mais granjas infectadas no "
+        "dia 120 em 17 de 20 sementes. A notificação por mortalidade de 10% em "
+        "72 h continua valendo, mas em granjas desse porte vem depois do dia "
+        "sorteado.",
         _SUSTAINED_OUTBREAK,
     ),
     # The sustained outbreak with the protocol on, so its effect is visible.
@@ -767,7 +769,8 @@ PARAM_PRESETS: tuple[ParamPreset, ...] = (
         "visitas a cada 3 e 7 dias, vazio sanitário de 30 dias e repovoamento "
         "com 20% monitorado por 60 dias. A duração da interrupção inicial do "
         "trânsito, a eficácia da desinfecção e o prazo de liberação das áreas "
-        "são suposições sinalizadas, a confirmar com a ADAGRO.",
+        "são suposições sinalizadas, a confirmar com a ADAGRO. Nas mesmas 20 "
+        "sementes, todo surto acaba antes do dia 120.",
         _SUSTAINED_OUTBREAK
         | {
             "protocol_enabled": 1,
@@ -790,17 +793,21 @@ PARAM_PRESETS: tuple[ParamPreset, ...] = (
     ParamPreset(
         "cadeia_logistica",
         "Cadeia logística",
-        "Valores ilustrativos, não calibrados: caminhões mais contaminantes, "
-        "pouca lavagem e fômites mais duráveis fazem da frota a principal via "
-        "de introdução nas granjas.",
+        "Valores ilustrativos, não calibrados com dados de campo: caminhões "
+        "mais contaminantes, pouca lavagem, fômites mais duráveis, "
+        "biosseguridade menor e detecção mais lenta fazem da frota a principal "
+        "via de introdução: 68% das granjas infectadas depois da inicial, "
+        "somadas 20 sementes. Na maioria das sementes, porém, nenhum caminhão "
+        "chega a infectar outra granja e o surto fica pequeno.",
         {
-            "infection_prob_truck_to_farm": 60.0,
+            "infection_prob_truck_to_farm": 80.0,
             "truck_disinfection_prob": 0.2,
             "fomite_survival_days": 7,
             "hub_transfer_fraction": 0.7,
             "local_spread_prob": 5.0,
             "infection_prob_bird_to_farm": 10.0,
-            "detection_time_max": 14,
+            "detection_time_max": 21,
+            "base_biosecurity": 40.0,
         },
     ),
 )

@@ -3,12 +3,12 @@
 import {
   $, h, empty, sleep, get, post, isAbort, ApiError, status, token, fmt,
   STATUSES, statusLabel, PATHWAYS, SEIR, kindLabel, eventLabel, eventCategory, EVENT_CATEGORIES,
-  ZONE_RINGS, zoneLabel, PROTOCOL_SOURCE,
+  ZONE_RINGS, zoneLabel, PROTOCOL_SOURCES, PRODUCTIONS, PRODUCTS,
 } from './common.js';
 import {timeChart, segmentedBar} from './charts.js';
 
 export const SIM_GROUPS = {
-  simFarms: ['sim-farms', 'sim-focus', 'sim-selected'],
+  simFarms: ['sim-farms', 'sim-farms-type', 'sim-focus', 'sim-selected'],
   simHubs: ['sim-hubs'],
   simTrucks: ['sim-trucks-intro', 'sim-trucks'],
   simBirds: ['sim-birds'],
@@ -16,7 +16,7 @@ export const SIM_GROUPS = {
   simInterventions: ['sim-interventions-fill', 'sim-interventions-line'],
   simAdmin: ['admin-line'],
   simChain: ['sim-chain-casing', 'sim-chain', 'sim-chain-local', 'sim-chain-arrows', 'sim-chain-seed', 'sim-chain-hubs'],
-  simFlocks: ['sim-flocks-halo', 'sim-flocks'],
+  simFlocks: ['sim-flocks-halo', 'sim-flocks', 'sim-flocks-site'],
   simHeat: ['sim-heat'],
   simZones: ['sim-zones-fill', 'sim-zones-standstill', 'sim-zones-casing', ...ZONE_RINGS.map(r => `sim-zones-${r.key}`)],
 };
@@ -25,6 +25,7 @@ const LIVE_SOURCES = [...REPLAY_SOURCES, 'risk'];
 // Fetched on their own schedule, only while their layer is checked.
 const OVERLAY_SOURCES = ['heat', 'chain', 'chain-hubs', 'flocks', 'zones', 'zones-edge'];
 const CHAIN_CLICK_LAYERS = ['sim-chain', 'sim-chain-local', 'sim-chain-seed'];
+const FLOCK_CLICK_LAYERS = ['sim-flocks', 'sim-flocks-site'];
 const PAUSE_MS = {slow: 900, normal: 350, fast: 60};  // pause between steps while running
 const SCRUB_DEBOUNCE_MS = 120;
 const MAX_EVENTS_KEPT = 2000;   // in-memory event log cap
@@ -35,6 +36,11 @@ const RT_AVERAGE_DAYS = 7;      // trailing window of the smoothed Rt line
 const HEAT_RECENT_DAYS = 30;    // "últimos 30 dias" heat window
 const FLOCK_DAYS = 7;           // flock arrivals shown up to the day on screen
 const HUB_BARS = 10;            // bars in "Bases na cadeia" (real worlds have ~4–10 hubs)
+const DAY_MS = 86_400_000;
+const MONTHS = ['janeiro', 'fevereiro', 'março', 'abril', 'maio', 'junho', 'julho', 'agosto', 'setembro', 'outubro', 'novembro', 'dezembro'];
+// Simulation dates are calendar days: format them in UTC so no time zone shifts the day.
+const DATE_FORMAT = new Intl.DateTimeFormat('pt-BR', {day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC'});
+const SHORT_DATE_FORMAT = new Intl.DateTimeFormat('pt-BR', {day: '2-digit', month: '2-digit', year: 'numeric', timeZone: 'UTC'});
 const CLICK_SLOP_PX = 5;        // thin chain lines are hard to hit exactly
 
 // ---------------------------------------------------------------- map layers
@@ -87,6 +93,8 @@ const ZONE_LINES = {
   protecao: {'line-width': 1.5, 'line-dasharray': [1.2, 2]},
 };
 const IS_RING = (key) => ['==', ['get', 'ring'], key];
+const HAS_SITE = ['==', ['typeof', ['get', 'site']], 'string'];
+const IS_FOCUS = ['==', ['get', 'focus'], true];
 
 export function addSimLayers(map) {
   for (const name of [...LIVE_SOURCES, ...OVERLAY_SOURCES]) map.addSource(`sim-${name}`, {type: 'geojson', data: empty()});
@@ -126,6 +134,9 @@ export function addSimLayers(map) {
     'circle-radius': FLOCK_RADIUS, 'circle-opacity': 0, 'circle-stroke-width': ['case', ['get', 'infected'], 5, 3.5], 'circle-stroke-opacity': FLOCK_FADE}});
   map.addLayer({id: 'sim-flocks', type: 'circle', source: 'sim-flocks', paint: {
     'circle-radius': FLOCK_RADIUS, 'circle-opacity': 0, 'circle-stroke-width': ['case', ['get', 'infected'], 2.5, 1.5], 'circle-stroke-opacity': FLOCK_FADE}});
+  // Flocks that landed at a documented site: a dot at the ring's centre.
+  map.addLayer({id: 'sim-flocks-site', type: 'circle', source: 'sim-flocks', filter: HAS_SITE, paint: {
+    'circle-radius': 3, 'circle-opacity': FLOCK_FADE, 'circle-stroke-width': 1, 'circle-stroke-opacity': FLOCK_FADE}});
   // Transmission chain: a surface-coloured casing keeps the pathway hues legible over the heat zone.
   map.addLayer({id: 'sim-chain-casing', type: 'line', source: 'sim-chain', filter: IS_LINE,
     layout: {'line-cap': 'round', 'line-join': 'round'}, paint: {'line-width': CHAIN_CASING_WIDTH, 'line-opacity': .8}});
@@ -142,16 +153,20 @@ export function addSimLayers(map) {
   // Introductions without a path (initial seeding, bird position unknown): a ring on the farm.
   map.addLayer({id: 'sim-chain-seed', type: 'circle', source: 'sim-chain', filter: ['==', ['geometry-type'], 'Point'],
     paint: {'circle-radius': 10, 'circle-opacity': 0, 'circle-stroke-width': 2}});
-  // Farms carry a second cue besides hue (size, ring, hollow) because five
+  // Farms carry a second cue besides hue (size, ring, hollow) because six
   // status hues cannot all stay distinguishable as map dots for every reader.
+  // Restocked farms keep the culled violet as their ring: birds again, after a cull.
   map.addLayer({id: 'sim-farms', type: 'circle', source: 'sim-farms',
-    layout: {'circle-sort-key': byStatus({healthy: 0, quarantined: 1, culled: 1, hidden: 2}, 3)},
+    layout: {'circle-sort-key': byStatus({healthy: 0, quarantined: 1, culled: 1, restocked: 1, hidden: 2}, 3)},
     paint: {
       'circle-radius': byStatus({healthy: 4.5, quarantined: 5.5, hidden: 6.5, notified: 7}, 5),
       'circle-opacity': byStatus({culled: 0}, 1),
-      'circle-stroke-width': byStatus({quarantined: 2.5, notified: 2.5, culled: 2.5}, 1.5),
+      'circle-stroke-width': byStatus({quarantined: 2.5, notified: 2.5, culled: 2.5, restocked: 2}, 1.5),
     }});
-  map.addLayer({id: 'sim-focus', type: 'symbol', source: 'sim-farms', filter: ['==', ['get', 'focus'], true], layout: {
+  // Production type is a shape cue, so status keeps the colour: laying farms get a surface-coloured core.
+  map.addLayer({id: 'sim-farms-type', type: 'circle', source: 'sim-farms', filter: ['==', ['get', 'production'], 'postura'],
+    paint: {'circle-radius': 1.75}});
+  map.addLayer({id: 'sim-focus', type: 'symbol', source: 'sim-farms', filter: IS_FOCUS, layout: {
     'icon-image': 'focus-square', 'icon-allow-overlap': true, 'icon-ignore-placement': true,
   }, paint: {'icon-halo-width': 1.5}});
   // Hubs that relayed fomite in the chain window: a ring behind the diamond, wider with more introductions.
@@ -204,6 +219,8 @@ export function createSim(map, {onLayersChanged, isActive}) {
     filters: new Set(EVENT_CATEGORIES.filter(c => c.on).map(c => c.key)),
     running: false, busy: false,
     riskMode: 'total', chartScope: 'all',
+    farmType: '',                  // '' = every farm, else a PRODUCTIONS key
+    arrivalProfile: null,          // monthly migratory arrival profile, from /api/sim/flocks
   };
   let replayAbort, detailAbort, scrubTimer;
   const replaying = () => sim.viewDay !== null;
@@ -215,8 +232,9 @@ export function createSim(map, {onLayersChanged, isActive}) {
   function paint() {
     const t = token, set = (layer, property, value) => map.setPaintProperty(layer, property, value);
     const status = Object.fromEntries(STATUSES.map(s => [s.key, t(`st-${s.key}`)]));
-    set('sim-farms', 'circle-color', byStatus({healthy: status.healthy, quarantined: status.quarantined, hidden: status.hidden, notified: status.notified}, status.culled));
-    set('sim-farms', 'circle-stroke-color', byStatus({quarantined: t('ink'), notified: t('ink'), culled: status.culled}, t('map-ring')));
+    set('sim-farms', 'circle-color', byStatus({healthy: status.healthy, quarantined: status.quarantined, hidden: status.hidden, notified: status.notified, restocked: status.restocked}, status.culled));
+    set('sim-farms', 'circle-stroke-color', byStatus({quarantined: t('ink'), notified: t('ink'), culled: status.culled, restocked: status.culled}, t('map-ring')));
+    set('sim-farms-type', 'circle-color', t('map-ring'));
     set('sim-selected', 'circle-stroke-color', t('ink'));
     const fomite = (property) => ['interpolate', ['linear'], ['get', property], 0, t('fomite-0'), .5, t('fomite-1'), 1, t('fomite-2')];
     set('sim-hubs', 'icon-color', fomite('load'));
@@ -229,6 +247,8 @@ export function createSim(map, {onLayersChanged, isActive}) {
     set('sim-interventions-line', 'line-color', status.culled);
     set('sim-flocks', 'circle-stroke-color', ['case', ['get', 'infected'], t('pw-birds'), t('bird-s')]);
     set('sim-flocks-halo', 'circle-stroke-color', t('map-ring'));
+    set('sim-flocks-site', 'circle-color', ['case', ['get', 'infected'], t('pw-birds'), t('bird-s')]);
+    set('sim-flocks-site', 'circle-stroke-color', t('map-ring'));
     // Initial seedings have no pathway hue: they take secondary ink, as in the timeline.
     const pathway = ['match', ['get', 'pathway'], ...PATHWAYS.flatMap(p => [p.transmission, t(`pw-${p.key}`)]), t('ink-2')];
     set('sim-chain-casing', 'line-color', t('map-ring'));
@@ -295,7 +315,7 @@ export function createSim(map, {onLayersChanged, isActive}) {
     const last = history.at(-1);
     if (!last || last.day !== state.day) return;
     const patch = {rt: state.rt, cost: state.cumulative_cost, deaths: state.total_deaths,
-      culled_birds: state.total_culled, infected_birds: state.infected_birds, birds: state.birds};
+      culled_birds: state.total_culled, infected_birds: state.infected_birds, birds: state.birds, lots: state.lots};
     // A truncated collection cannot be counted; keep the step-time counts then.
     if (!farms.truncated) {
       for (const s of STATUSES) patch[s.key] = 0;
@@ -370,6 +390,12 @@ export function createSim(map, {onLayersChanged, isActive}) {
   // ------------------------------------------------------------ rendering
   const rowFor = (day) => sim.history.findLast(row => row.day === day);
   const shownDay = () => sim.viewDay ?? sim.state.day;
+  /** Calendar date of a simulated day, from today's `date`; null when the server sends none. */
+  function dateOf(day) {
+    const today = Date.parse(`${sim.state.date}T00:00:00Z`);
+    return Number.isFinite(today) ? new Date(today + (day - sim.state.day) * DAY_MS) : null;
+  }
+  const dateText = (day) => { const date = dateOf(day); return date ? DATE_FORMAT.format(date) : ''; };
 
   function renderAll() {
     renderPlayback();
@@ -377,6 +403,7 @@ export function createSim(map, {onLayersChanged, isActive}) {
     renderCharts();
     renderTable();
     renderTimeline();
+    renderArrivalProfile();
     if (sim.selected) renderCard();
   }
 
@@ -390,6 +417,7 @@ export function createSim(map, {onLayersChanged, isActive}) {
     $('scrub-first').textContent = `dia ${first}`;
     $('scrub-last').textContent = `dia ${last}`;
     $('playback-day').textContent = `Dia ${shownDay()}`;
+    $('playback-date').textContent = dateText(shownDay());
     $('playback-mode').textContent = replaying() ? `revendo; ao vivo é o dia ${last}` : 'ao vivo';
     $('playback-mode').dataset.state = replaying() ? 'replay' : 'live';
     $('go-live').hidden = !replaying();
@@ -397,13 +425,25 @@ export function createSim(map, {onLayersChanged, isActive}) {
     document.body.classList.toggle('replaying', replaying());
     const s = sim.state;
     const notes = [];
-    if (s.synthetic_facilities) notes.push('Granjas e bases sintéticas: o mundo não tem instalações.');
+    if (s.synthetic_facilities) {
+      notes.push(h('span', {}, 'Granjas sintéticas, não reais: número, porte e município sorteados por dados oficiais '
+        + '(IBGE PPM 2024, POG 1º tri 2025, ADAGRO); bases posicionadas por suposição. Fontes em ', h('code', {}, 'docs/FONTES_DADOS.md'), '.'));
+    }
     if (!s.risk_available) notes.push('Risco indisponível: o mundo não tem raster ambiental.');
     if (protocolOn()) notes.push('Protocolo oficial de trânsito (MAPA) ativo; as suposições estão marcadas em Cenário e parâmetros.');
-    notes.push(`${fmt.int(s.farms)} granjas, ${fmt.int(s.trucks)} caminhões em ${fmt.int(s.hubs)} bases, semente ${s.seed}.`);
+    notes.push(`${fmt.int(s.farms)} granjas${farmKindsText(s.farms_by_kind)}, ${fmt.int(s.trucks)} caminhões em ${fmt.int(s.hubs)} bases, semente ${s.seed}.`);
     $('sim-notes').replaceChildren(...notes.map(note => h('li', {}, note)));
     for (const input of document.querySelectorAll('input[name=risk-mode]')) input.disabled = !s.risk_available;
     renderProtocol();
+  }
+
+  /** " (205 de corte, 62 de postura)" from `farms_by_kind`; other kinds by their label. */
+  function farmKindsText(byKind) {
+    const parts = Object.entries(byKind ?? {}).map(([kind, count]) => {
+      const production = PRODUCTIONS.find(p => p.kind === kind);
+      return `${fmt.int(count)} ${production ? production.plural : kindLabel(kind).toLowerCase()}`;
+    });
+    return parts.length ? ` (${parts.join(', ')})` : '';
   }
 
   /** Zones layer, focus legend and KPI tile exist only while the protocol is on. */
@@ -423,7 +463,8 @@ export function createSim(map, {onLayersChanged, isActive}) {
       $(id).querySelector('.kpi-value').textContent = value;
       $(id).querySelector('.kpi-note').textContent = note;
     };
-    put('kpi-day', String(row.day), replaying() ? 'replay' : 'ao vivo');
+    const date = dateOf(row.day);
+    put('kpi-day', String(row.day), [date ? SHORT_DATE_FORMAT.format(date) : null, replaying() ? 'replay' : 'ao vivo'].filter(Boolean).join(' · '));
     const rt = $('kpi-rt');
     const trend = prev && Number.isFinite(prev.rt) ? Math.sign(row.rt - prev.rt) : 0;
     rt.querySelector('.kpi-value').textContent = fmt.dec(row.rt);
@@ -441,6 +482,7 @@ export function createSim(map, {onLayersChanged, isActive}) {
     segmentedBar($('status-ribbon'), STATUSES.map(s => ({label: s.plural, value: row[s.key], color: `st-${s.key}`, text: fmt.int(row[s.key])})),
       `Granjas por situação no dia ${row.day}`);
     renderProtocolKpi();
+    renderMarkets();
   }
 
   /** Live counts come from the state; a replayed day only has them through that day's zones. */
@@ -481,6 +523,15 @@ export function createSim(map, {onLayersChanged, isActive}) {
       rows, kind: 'bars', markDay, onPick, label: 'Introduções em granjas por via', format: fmt.int, tick: fmt.int,
       series: PATHWAYS.map(p => ({label: p.label.toLowerCase(), color: `pw-${p.key}`, value: row => row.introductions[p.event]})),
     });
+    // Lot tallies are cumulative; both products add up as lots (their quantities have different units).
+    const lots = (tally) => (row) => row.lots ? PRODUCTS.reduce((sum, p) => sum + (row.lots[p.key]?.[tally]?.lots ?? 0), 0) : NaN;
+    timeChart($('chart-lots'), $('readout-lots'), {
+      rows, kind: 'line', markDay, onPick, label: 'Lotes expostos e recolhidos, acumulado', format: fmt.int, tick: fmt.compact,
+      series: [
+        {label: 'lotes expostos', color: 'st-hidden', value: lots('exposed')},
+        {label: 'expostos recolhidos', color: 'series-neutral', value: lots('exposed_recalled')},
+      ],
+    });
     timeChart($('chart-cost'), $('readout-cost'), {
       rows, kind: 'line', markDay, onPick, label: 'Custo acumulado', format: fmt.money, tick: fmt.moneyCompact,
       series: [{label: 'custo', color: 'series-neutral', value: row => row.cost}],
@@ -508,10 +559,94 @@ export function createSim(map, {onLayersChanged, isActive}) {
       ['Aves mortas', row => fmt.int(row.deaths)],
       ['Custo', row => fmt.money(row.cost)],
       ['Aves silv. infectadas', row => fmt.int(row.infected_birds)],
+      ...PRODUCTS.flatMap(p => [
+        [`Lotes expostos (${p.label.toLowerCase()})`, row => fmt.int(row.lots?.[p.key]?.exposed.lots)],
+        [`Lotes recolhidos (${p.label.toLowerCase()})`, row => fmt.int(row.lots?.[p.key]?.recalled.lots)],
+      ]),
     ];
     $('data-table-body').replaceChildren(h('table', {class: 'grid-table numeric'},
       h('thead', {}, h('tr', {}, columns.map(([name]) => h('th', {scope: 'col'}, name)))),
       h('tbody', {}, rows.map(row => h('tr', {}, columns.map(([, value]) => h('td', {}, String(value(row)))))))));
+  }
+
+  // ------------------------------------------------------------ production and markets
+  // Cumulative tallies as of the day on screen: the history row when replaying,
+  // the state when live (it includes recalls made by interventions since the step).
+  const lotsShown = () => replaying() ? rowFor(shownDay())?.lots : sim.state.lots;
+  const MARKET_ROWS = [
+    ['exposed', 'Expostos', 'saídos de granja infectada ainda não notificada'],
+    ['exposed_recalled', 'Expostos recolhidos', null],
+    ['exposed_outside_window', 'Expostos fora da janela', 'coletados antes da janela de rastreamento: não recolhidos'],
+    ['notified', 'De granja já notificada', 'coletados depois da notificação'],
+    ['recalled', 'Recolhidos, total', 'inclui lotes não expostos das granjas rastreadas'],
+  ];
+
+  function renderMarkets() {
+    const lots = lotsShown();
+    if (!lots) {
+      $('markets-note').textContent = 'Este servidor não informa lotes de produto.';
+      $('markets-table').replaceChildren();
+      return;
+    }
+    const cell = (tally, product) => {
+      const {lots: count, quantity} = tally;
+      return h('td', {}, fmt.int(count), count ? h('span', {class: 'qty'}, `${fmt.compact(quantity)} ${product.unit}`) : null);
+    };
+    $('markets-note').textContent = `Lotes coletados por caminhões de entrepostos de ovos e abatedouros, acumulados até o dia ${shownDay()}.`;
+    $('markets-table').replaceChildren(h('table', {class: 'grid-table markets-grid'},
+      h('thead', {}, h('tr', {}, h('th', {scope: 'col'}, 'Lotes'), PRODUCTS.map(p => h('th', {scope: 'col'}, `${p.label} (${p.unit})`)))),
+      h('tbody', {},
+        MARKET_ROWS.map(([key, label, note]) => h('tr', {title: note},
+          h('th', {scope: 'row'}, label), PRODUCTS.map(p => lots[p.key] ? cell(lots[p.key][key], p) : h('td', {}, '—')))),
+        h('tr', {}, h('th', {scope: 'row', title: 'Do dia da coleta ao dia do recolhimento, nos lotes expostos recolhidos'}, 'Exposição média até o recolhimento'),
+          PRODUCTS.map(p => {
+            const days = lots[p.key]?.mean_exposure_days;
+            return h('td', {}, Number.isFinite(days) ? `${fmt.num(days, 1)} dias` : 'sem recolhimento');
+          })))));
+    renderMarketHubs();
+  }
+
+  // Product hubs ranked by exposed lots. /api/sim/lots also returns every lot
+  // of the window (hundreds of kB per simulated month), so it is fetched only
+  // while the list is open or a hub popup asks, and reused until the run, the
+  // day on screen or the live day changes.
+  const markets = {key: null, data: null, abort: null};
+  const marketsKey = () => `${overlay.run}:${shownDay()}:${sim.state.day}`;
+
+  async function marketHubs() {
+    const key = marketsKey();
+    if (markets.key === key) return markets.data;
+    markets.abort?.abort();
+    const controller = markets.abort = new AbortController();
+    try {
+      const data = await get(`/api/sim/lots?to_day=${shownDay()}`, {signal: controller.signal});
+      if (markets.abort !== controller) return null;
+      markets.key = key; markets.data = data.hubs;
+      return data.hubs;
+    } catch (error) {
+      if (!isAbort(error)) status(`Lotes: ${error.message}`, 'error');
+      return null;
+    }
+  }
+
+  async function renderMarketHubs() {
+    const note = $('markets-hubs-note'), bars = $('markets-hubs-bars');
+    if (!$('markets-hubs').open) { markets.abort?.abort(); return; }
+    if (markets.key !== marketsKey()) note.textContent = 'Carregando os lotes…';
+    const hubs = await marketHubs();
+    if (!hubs || !$('markets-hubs').open) return;
+    note.textContent = `Lotes coletados até o dia ${shownDay()}, pela base de destino.`
+      + (replaying() ? ` Recolhimentos contados até o dia ${sim.state.day} (ao vivo).` : '');
+    if (!hubs.length) { bars.replaceChildren(h('li', {class: 'muted'}, 'Nenhum entreposto de ovos ou abatedouro neste cenário.')); return; }
+    const top = Math.max(...hubs.map(hub => hub.exposed_lots), 1);
+    bars.replaceChildren(...hubs.map(hub => {
+      const text = `${hubName(hub)}: ${plural(hub.exposed_lots, 'lote exposto', 'lotes expostos')} de ${fmt.int(hub.lots)}, `
+        + `${plural(hub.recalled_lots, 'recolhido', 'recolhidos')}, ${fmt.int(hub.outside_window_lots)} fora da janela`;
+      return h('li', {}, h('button', {type: 'button', class: 'rank-bar', title: text, 'aria-label': `${text}. Mostrar no mapa.`, onclick: () => flyToHub(hub)},
+        h('span', {class: 'rank-name'}, hubName(hub)),
+        h('span', {class: 'rank-track'}, h('span', {class: 'rank-fill', style: `width: ${hub.exposed_lots / top * 100}%`})),
+        h('span', {class: 'rank-value'}, fmt.int(hub.exposed_lots))));
+    }));
   }
 
   // ------------------------------------------------------------ events timeline
@@ -541,6 +676,8 @@ export function createSim(map, {onLayersChanged, isActive}) {
     BLOQUEIO_MOVIMENTACAO: 'st-quarantined', MELHORIA_BIOSSEGURANCA: 'st-healthy', INFECCAO_AVES_SILVESTRES: 'pw-birds',
     CHEGADA_BANDO_INFECTADO: 'pw-birds', INFECCAO: 'st-hidden', FIM_INFECCAO: 'muted',
     FOCO_CONFIRMADO: 'zone', DESPOVOAMENTO: 'st-culled', INTERDICAO_TRANSITO: 'zone', VIGILANCIA_ATIVA: 'st-notified',
+    VAZIO_SANITARIO: 'st-culled', REPOVOAMENTO: 'st-restocked', REPOVOAMENTO_TOTAL: 'st-healthy',
+    RECOLHIMENTO_LOTES: 'series-neutral',
   })[type] ?? 'muted';
 
   function renderTimeline() {
@@ -797,6 +934,38 @@ export function createSim(map, {onLayersChanged, isActive}) {
     if (!data) return;
     for (const feature of data.features) feature.properties.age = day - feature.properties.day;
     map.getSource('sim-flocks').setData(data);
+    if (Array.isArray(data.arrival_profile) && data.arrival_profile.length === MONTHS.length) {
+      sim.arrivalProfile = data.arrival_profile;
+      renderArrivalProfile();
+    }
+  }
+
+  /** Monthly arrival rate relative to the peak, with the month of the day on screen marked. */
+  function renderArrivalProfile() {
+    const figure = $('arrival-profile'), profile = sim.arrivalProfile, date = sim.state && dateOf(shownDay());
+    figure.hidden = !profile;
+    if (!profile) return;
+    const current = date ? date.getUTCMonth() : -1;
+    const bars = $('arrival-profile-bars');
+    bars.replaceChildren(...profile.map((value, month) => h('span', {
+      class: `month-bar${month === current ? ' current' : ''}`, title: `${MONTHS[month]}: ${fmt.num(value * 100, 0)}% do pico`,
+    }, h('span', {class: 'month-fill', style: `--v: ${Math.max(0, Math.min(1, value))}`}), h('span', {class: 'month-name'}, MONTHS[month][0].toUpperCase()))));
+    bars.setAttribute('role', 'img');
+    bars.setAttribute('aria-label', 'Chegadas de bandos por mês, em relação ao pico: '
+      + profile.map((value, month) => `${MONTHS[month]} ${fmt.num(value * 100, 0)}%`).join(', ')
+      + (current >= 0 ? `. Mês do dia exibido: ${MONTHS[current]}.` : '.'));
+  }
+
+  function flockPopup(p, lngLat) {
+    const rows = [
+      ['Chegada', `dia ${p.day}${dateText(p.day) ? ` (${dateText(p.day)})` : ''}`],
+      ['Aves', fmt.int(p.size)],
+      ['Infecção', p.infected ? 'chegou com ave infectada' : 'sem ave infectada'],
+      ['Sítio de pouso', p.site || 'nenhum sítio documentado: ponto de água sorteado'],
+    ];
+    new maplibregl.Popup({closeButton: true, maxWidth: '260px'}).setLngLat(lngLat).setDOMContent(h('div', {class: 'hub-popup'},
+      h('strong', {}, 'Bando migratório'),
+      h('table', {class: 'kv'}, h('tbody', {}, rows.map(([key, value]) => h('tr', {}, h('th', {scope: 'row'}, key), h('td', {}, value))))))).addTo(map);
   }
 
   // Zones depend only on the run and the day, so a refresh on the same day
@@ -871,12 +1040,14 @@ export function createSim(map, {onLayersChanged, isActive}) {
     $('farm-card-sub').textContent = [detail?.municipality ?? feature?.municipality, kindLabel(detail?.kind ?? feature?.kind), name ? id : null]
       .filter(Boolean).join(', ');
     if (!feature && !detail) { $('farm-card-body').replaceChildren(h('p', {class: 'muted'}, 'Carregando…')); return; }
-    // Compartments and status follow the day on screen: the detail's top-level
-    // fields when live, the replayed farm collection when revisiting a day.
+    // Compartments and status follow the day on screen: the farm collection
+    // (live or replayed), refetched with every refresh, so a farm restocked by
+    // the last step unlocks before its slower detail request returns.
     const historyRow = detail?.history?.findLast(row => row.day === shownDay());
-    const current = (!replaying() && detail) || feature || historyRow || {};
+    const current = feature || (!replaying() && detail) || historyRow || {};
     const farmStatus = current.status ?? detail?.status;
-    const culled = detail ? detail.culled : farmStatus === 'culled';
+    const culled = current.culled ?? farmStatus === 'culled';
+    const production = PRODUCTIONS.find(p => p.key === (feature ?? detail).production);
     const seirTotal = SEIR.reduce((sum, c) => sum + (current[c.key] ?? 0), 0);
     const seirBar = h('div', {class: 'seg-bar tall'});
     segmentedBar(seirBar, SEIR.map(c => ({label: c.label, value: current[c.key] ?? 0, color: `seir-${c.key}`, text: fmt.int(current[c.key] ?? 0)})),
@@ -910,7 +1081,8 @@ export function createSim(map, {onLayersChanged, isActive}) {
     else if (first >= 0) gap = `${sim.state.day - first} dias sem detecção`;
     const boosted = detail.under_biosec_boost;
     const facts = [
-      ['População', fmt.int(detail.pop_total)],
+      ['Produção', production ? `${production.label} (${production.note})` : 'tipo não informado'],
+      ['Aves alojadas / capacidade', housedText(current.housed ?? detail.housed, detail.pop_total)],
       ['Biosseguridade', `${fmt.num(detail.biosecurity, 0)}%${boosted ? ' (reforçada)' : ''}`],
       ['Em quarentena', detail.quarantined ? 'sim' : 'não'],
       ...(protocolOn() ? [['Zona de emergência', zoneText(current)]] : []),
@@ -932,7 +1104,8 @@ export function createSim(map, {onLayersChanged, isActive}) {
         values ? `Biosseguridade ${fmt.num(detail.biosecurity, 0)}% → ${fmt.num(Math.min(100, detail.biosecurity + values.biosecurity_boost_amount), 0)}% por ${fmt.money(values.biosecurity_investment_cost)}.`
           : 'Aumenta a biosseguridade da granja.'],
     ];
-    const disabledWhy = culled ? 'Granja já sacrificada.' : replaying() ? 'Volte ao vivo para intervir: intervenções valem para o dia atual.' : null;
+    const disabledWhy = replaying() ? 'Volte ao vivo para intervir: intervenções valem para o dia atual.'
+      : culled ? `Granja já sacrificada${protocolOn() ? '; volta a aceitar intervenções quando for repovoada' : ''}.` : null;
 
     body.push(
       chart,
@@ -959,6 +1132,12 @@ export function createSim(map, {onLayersChanged, isActive}) {
     const hub = sim.hubs.get(id);
     if (hub) return h('button', {type: 'button', class: 'link inline', title: 'Mostrar a base no mapa', onclick: () => flyTo(hub.geometry.coordinates)}, id);
     return id ?? '—';
+  }
+  /** Birds housed now against capacity; below capacity while partly restocked or empty. */
+  function housedText(housed, capacity) {
+    if (!Number.isFinite(housed)) return fmt.int(capacity);
+    const share = capacity > 0 && housed < capacity ? ` (${fmt.num(housed / capacity * 100, 0)}%)` : '';
+    return `${fmt.int(housed)} / ${fmt.int(capacity)}${share}`;
   }
   /** `zone` absent (an older snapshot) is unknown; null means outside every ring. */
   function zoneText({zone, focus}) {
@@ -993,7 +1172,8 @@ export function createSim(map, {onLayersChanged, isActive}) {
     $('scenario-fields').replaceChildren(...[...groups].map(([group, fields]) =>
       h('fieldset', {class: 'param-group'}, h('legend', {}, group),
         fields.some(field => field.name === 'protocol_enabled') ? h('p', {class: 'param-group-source'},
-          'Fonte: ', h('cite', {}, PROTOCOL_SOURCE), '. Valores marcados como suposição não constam no documento.') : null,
+          'Fontes: ', PROTOCOL_SOURCES.flatMap((source, i) => [i ? '; ' : '', h('cite', {}, source)]),
+          '. Cada parâmetro cita a sua no selo "fonte"; valores marcados como suposição não constam nos documentos.') : null,
         ...fields.map(field => paramRow(field, values[field.name], defaults[field.name])))));
     const presets = sim.params.presets ?? [];
     $('scenario-preset-row').hidden = !presets.length;
@@ -1109,18 +1289,39 @@ export function createSim(map, {onLayersChanged, isActive}) {
     const farm = hits.find(hit => hit.layer.id === 'sim-farms');
     if (farm) { selectFarm(farm.properties.id); return; }
     const hub = hits.find(hit => hit.layer.id === 'sim-hubs');
-    if (hub) {
-      const p = hub.properties;
-      new maplibregl.Popup({closeButton: true, maxWidth: '260px'}).setLngLat(hub.geometry.coordinates).setDOMContent(h('div', {class: 'hub-popup'},
-        h('strong', {}, p.name || `Base ${p.id}`), h('p', {}, kindLabel(p.kind)),
-        h('table', {class: 'kv'}, h('tbody', {},
-          h('tr', {}, h('th', {}, 'Carga de fômite'), h('td', {}, `${fmt.num(p.load * 100, 0)}%`)),
-          h('tr', {}, h('th', {}, 'Caminhões'), h('td', {}, fmt.int(p.trucks))))))).addTo(map);
-      return;
-    }
+    if (hub) { hubPopup(hub.properties, hub.geometry.coordinates); return; }
+    const [flock] = query(event.point, shown(FLOCK_CLICK_LAYERS));
+    if (flock) { flockPopup(flock.properties, flock.geometry.coordinates); return; }
     const {x, y} = event.point;
     const [link] = query([[x - CLICK_SLOP_PX, y - CLICK_SLOP_PX], [x + CLICK_SLOP_PX, y + CLICK_SLOP_PX]], shown(CHAIN_CLICK_LAYERS));
     if (link) chainPopup(link.properties, event.lngLat);
+  }
+
+  function hubPopup(p, lngLat) {
+    const kv = (key, value) => h('tr', {}, h('th', {}, key), h('td', {}, value));
+    const rows = h('tbody', {}, kv('Carga de fômite', `${fmt.num(p.load * 100, 0)}%`), kv('Caminhões', fmt.int(p.trucks)));
+    new maplibregl.Popup({closeButton: true, maxWidth: '280px'}).setLngLat(lngLat).setDOMContent(h('div', {class: 'hub-popup'},
+      h('strong', {}, p.name || `Base ${p.id}`), h('p', {}, kindLabel(p.kind)), h('table', {class: 'kv'}, rows))).addTo(map);
+    // Product hubs (entrepostos, abatedouros) also list the lots they received.
+    const day = shownDay();
+    marketHubs().then(hubs => {
+      const tally = hubs?.find(item => item.id === p.id);
+      if (!tally || !rows.isConnected) return;
+      const unit = PRODUCTS.find(item => item.key === tally.product)?.unit ?? '';
+      rows.append(
+        kv(`Lotes até o dia ${day}`, `${fmt.int(tally.lots)} (${fmt.compact(tally.quantity)} ${unit})`),
+        kv('Expostos', `${fmt.int(tally.exposed_lots)}${tally.exposed_lots ? ` (${fmt.compact(tally.exposed_quantity)} ${unit})` : ''}`),
+        kv('Recolhidos', fmt.int(tally.recalled_lots)),
+        kv('Expostos fora da janela', fmt.int(tally.outside_window_lots)));
+    });
+  }
+
+  /** Map filter for the "Mostrar granjas" choice; status and focus filters are combined with it. */
+  function applyFarmType() {
+    const type = sim.farmType ? ['==', ['get', 'production'], sim.farmType] : true;
+    map.setFilter('sim-farms', type === true ? null : type);
+    map.setFilter('sim-farms-type', ['all', ['==', ['get', 'production'], 'postura'], type]);
+    map.setFilter('sim-focus', ['all', IS_FOCUS, type]);
   }
 
   function wire() {
@@ -1145,6 +1346,10 @@ export function createSim(map, {onLayersChanged, isActive}) {
       });
     }
     $('data-table').addEventListener('toggle', renderTable);
+    $('markets-hubs').addEventListener('toggle', renderMarketHubs);
+    for (const input of document.querySelectorAll('input[name=farm-type]')) {
+      input.addEventListener('change', () => { sim.farmType = input.value; applyFarmType(); });
+    }
     for (const [name, refresh] of [['heat', refreshHeat], ['chain', refreshChain], ['flocks', refreshFlocks], ['zones', refreshZones]]) {
       toggle(name).addEventListener('change', () => { if (toggle(name).checked) refresh(); else clearOverlay(name); });
     }
@@ -1159,7 +1364,7 @@ export function createSim(map, {onLayersChanged, isActive}) {
     $('scenario-form').addEventListener('submit', applyScenario);
     map.on('mouseenter', 'sim-farms', () => { map.getCanvas().style.cursor = 'pointer'; });
     map.on('mouseleave', 'sim-farms', () => { map.getCanvas().style.cursor = ''; });
-    for (const layer of ['sim-hubs', ...CHAIN_CLICK_LAYERS]) {
+    for (const layer of ['sim-hubs', ...CHAIN_CLICK_LAYERS, ...FLOCK_CLICK_LAYERS]) {
       map.on('mouseenter', layer, () => { map.getCanvas().style.cursor = 'pointer'; });
       map.on('mouseleave', layer, () => { map.getCanvas().style.cursor = ''; });
     }

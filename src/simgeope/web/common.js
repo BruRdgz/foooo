@@ -97,6 +97,8 @@ export const STATUSES = [
   {key: 'hidden', label: 'Infectada oculta', plural: 'Ocultas'},
   {key: 'notified', label: 'Notificada', plural: 'Notificadas'},
   {key: 'culled', label: 'Sacrificada', plural: 'Sacrificadas'},
+  // Partly restocked after the sanitary void, under monitoring (official protocol).
+  {key: 'restocked', label: 'Repovoada', plural: 'Repovoadas'},
 ];
 export const statusLabel = (key) => STATUSES.find(s => s.key === key)?.label ?? key;
 
@@ -116,8 +118,23 @@ export const SEIR = [
   {key: 'dead', label: 'Mortas'},
 ];
 
-export const HUB_KINDS = {feed_mill: 'Fábrica de ração', slaughterhouse: 'Abatedouro', farm: 'Granja', producer: 'Produtor'};
+export const HUB_KINDS = {
+  feed_mill: 'Fábrica de ração', slaughterhouse: 'Abatedouro', egg_grading: 'Entreposto de ovos',
+  farm: 'Granja', producer: 'Produtor', farm_layer: 'Granja de postura', farm_broiler: 'Granja de corte',
+};
 export const kindLabel = (kind) => HUB_KINDS[kind] ?? kind ?? '—';
+
+// Farm production type (`production` in /api/sim/farms); null when the facility kind does not say.
+export const PRODUCTIONS = [
+  {key: 'postura', kind: 'farm_layer', label: 'Postura', plural: 'de postura', note: 'poedeiras, ovos'},
+  {key: 'corte', kind: 'farm_broiler', label: 'Corte', plural: 'de corte', note: 'frangos'},
+];
+
+// Product lots (/api/sim/state `lots`, /api/sim/lots): quantity units per product.
+export const PRODUCTS = [
+  {key: 'ovos', label: 'Ovos', unit: 'dúzias'},
+  {key: 'aves', label: 'Aves vivas', unit: 'aves'},
+];
 
 export const EVENT_LABELS = {
   INTRODUCAO_INICIAL: 'Introdução inicial',
@@ -135,12 +152,16 @@ export const EVENT_LABELS = {
   MELHORIA_BIOSSEGURANCA: 'Melhoria de biosseguridade',
   INFECCAO_AVES_SILVESTRES: 'Infecção de aves silvestres',
   CHEGADA_BANDO_INFECTADO: 'Bando infectado chegou',
-  AVISO_AVES: 'Aviso',
-  AVISO_FROTA: 'Aviso',
+  AVISO_AVES: 'Aviso das aves silvestres',
+  AVISO_FROTA: 'Aviso da frota',
   FOCO_CONFIRMADO: 'Foco confirmado',
   DESPOVOAMENTO: 'Despovoamento do foco',
   INTERDICAO_TRANSITO: 'Trânsito interrompido',
   VIGILANCIA_ATIVA: 'Detecção por vigilância ativa',
+  VAZIO_SANITARIO: 'Vazio sanitário',
+  REPOVOAMENTO: 'Repovoamento parcial',
+  REPOVOAMENTO_TOTAL: 'Repovoamento total',
+  RECOLHIMENTO_LOTES: 'Recolhimento de lotes',
 };
 // Emergency-area rings of the official transit protocol, most restrictive first.
 // `radius` is the ModelParams field holding the ring's outer radius.
@@ -150,9 +171,14 @@ export const ZONE_RINGS = [
   {key: 'protecao', label: 'Proteção', radius: 'protection_radius_km'},
 ];
 export const zoneLabel = (key) => ZONE_RINGS.find(r => r.key === key)?.label ?? key;
-// The document behind the protocol parameter group (no stable public URL is known).
-export const PROTOCOL_SOURCE = 'MAPA, Procedimento Operacional Padrão para Postos Fixos e Equipes Volantes em '
-  + 'Emergência Zoossanitária, parte específica IAAP e DNC, versão 1.0, novembro de 2023';
+// The documents behind the protocol parameter group (no stable public URL is
+// known); each parameter cites its own page in its source badge.
+export const PROTOCOL_SOURCES = [
+  'MAPA, Plano de Contingência para Emergências Zoossanitárias, parte específica Influenza Aviária de '
+    + 'Alta Patogenicidade e Doença de Newcastle, versão 1.0, junho de 2023',
+  'MAPA, Procedimento Operacional Padrão para Postos Fixos e Equipes Volantes em Emergência Zoossanitária, '
+    + 'parte específica IAAP e DNC, versão 1.0, novembro de 2023',
+];
 
 export const eventLabel = (type) => EVENT_LABELS[type] ?? type;
 
@@ -165,7 +191,8 @@ export const EVENT_CATEGORIES = [
     types: ['DETECCAO', 'REACAO_AUTOMATICA', 'LIBERACAO_QUARENTENA', 'QUARENTENA_PERIFERICA']},
   {key: 'action', label: 'Intervenções', on: true,
     types: ['SACRIFICIO_SANITARIO', 'BLOQUEIO_MOVIMENTACAO', 'MELHORIA_BIOSSEGURANCA',
-      'FOCO_CONFIRMADO', 'DESPOVOAMENTO', 'INTERDICAO_TRANSITO', 'VIGILANCIA_ATIVA']},
+      'FOCO_CONFIRMADO', 'DESPOVOAMENTO', 'INTERDICAO_TRANSITO', 'VIGILANCIA_ATIVA', 'RECOLHIMENTO_LOTES']},
+  {key: 'restock', label: 'Pós-foco', on: true, types: ['VAZIO_SANITARIO', 'REPOVOAMENTO', 'REPOVOAMENTO_TOTAL']},
   {key: 'birds', label: 'Aves silvestres', on: true, types: ['INFECCAO_AVES_SILVESTRES', 'CHEGADA_BANDO_INFECTADO']},
   {key: 'course', label: 'Curso da infecção', on: false, types: ['INFECCAO', 'FIM_INFECCAO']},
   {key: 'warn', label: 'Avisos', on: true, types: ['AVISO_AVES', 'AVISO_FROTA']},

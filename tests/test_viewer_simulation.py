@@ -143,6 +143,7 @@ def test_param_schema_covers_every_scalar_model_parameter(client):
     )
     groups = list(dict.fromkeys(spec["group"] for spec in body["schema"]))
     assert groups == [
+        "Calendário",
         "SEIR intra-granja",
         "Vigilância e reação",
         "Aves silvestres",

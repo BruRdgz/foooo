@@ -8,6 +8,7 @@ import warnings
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import astuple, dataclass, fields
+from datetime import date, timedelta
 from itertools import takewhile
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
@@ -65,6 +66,9 @@ def sample_point_in(polygon_metric, uniform, *, attempts: int = 200) -> Point | 
     return None
 
 
+# Year of day 0. Arbitrary: the model is not calibrated to any year; a
+# non-leap year keeps month lengths fixed.
+REFERENCE_YEAR = 2025
 # Standard deviation of landing positions around a flock's arrival site.
 FLOCK_SPREAD_M = 300.0
 # Width given to mapped water lines (rivers, canals, coastline) when weighing
@@ -449,7 +453,12 @@ class AgentModel(WorldModel):
         service_s = p.truck_service_minutes * 60.0
         assignment: dict[HubAgent, list[FarmAgent]] = {hub: [] for hub in hubs}
         unserved = 0
-        for farm in sorted(self.farms, key=lambda f: f.farm_id):
+        clients = (
+            self.farms
+            if spec.client_kinds is None
+            else [f for f in self.farms if f.facility.kind in spec.client_kinds]
+        )
+        for farm in sorted(clients, key=lambda f: f.farm_id):
             feasible = []
             for hub in hubs:
                 round_trip_s = (
@@ -641,6 +650,12 @@ class AgentModel(WorldModel):
     def run(self, days: int) -> None:
         for _ in range(days):
             self.step()
+
+    @property
+    def current_date(self) -> date:
+        """Calendar date of the current day; day 0 is the 1st of ``start_month``."""
+        start = date(REFERENCE_YEAR, self.params.start_month, 1)
+        return start + timedelta(days=self.day_count)
 
     # -------------------------------------------------------- subsystems
     def _bird_to_farm(self) -> None:

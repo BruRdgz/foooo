@@ -287,6 +287,46 @@ def test_fleet_setup_assigns_nearest_hub_and_reports_unreachable_farms(
     assert west.hub_id not in {t.base.hub_id for t in model.trucks}
 
 
+@pytest.mark.parametrize(
+    "client_kinds,expected",
+    [
+        (None, ["f1", "f2", "f3"]),
+        (("farm_layer",), ["f1"]),
+        (("farm_layer", "farm"), ["f1", "f3"]),
+        (("market",), []),
+    ],
+)
+def test_fleet_serves_only_its_client_kinds(two_way_world, client_kinds, expected):
+    model = AgentModel(
+        two_way_world,
+        params=ModelParams(fleets=(FleetSpec("egg_grading", 1, 3, client_kinds),)),
+    )
+    model.add_hub(Facility("hub", "egg_grading", -35.0, -8.0))
+    for farm_id, kind, lon in (
+        ("f1", "farm_layer", -34.99),
+        ("f2", "farm_broiler", -34.98),
+        ("f3", "farm", -34.98),
+    ):
+        model.add_farm(Facility(farm_id, kind, lon, -8.0))
+
+    model.setup_fleets()
+
+    served = [farm.farm_id for truck in model.trucks for farm in truck.clients]
+    assert sorted(served) == expected
+    assert [f.production for f in model.farms] == ["postura", "corte", None]
+
+
+@pytest.mark.parametrize(
+    "start_month,day,expected", [(1, 0, "2025-01-01"), (8, 31, "2025-09-01")]
+)
+def test_current_date_starts_on_first_of_start_month(
+    tiny_world, start_month, day, expected
+):
+    model = AgentModel(tiny_world, params=ModelParams(start_month=start_month))
+    model.day_count = day
+    assert model.current_date.isoformat() == expected
+
+
 def _provenance_model(world, routes, *, max_stops=1, **params):
     """A mill at node 10; infected f1 (node 20) and healthy f2 (node 30).
 

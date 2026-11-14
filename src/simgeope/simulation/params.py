@@ -15,15 +15,23 @@ class FleetSpec:
     Examples: ``feed_mill`` (ração: fábrica → várias granjas → fábrica),
     ``slaughterhouse`` (aves vivas: abatedouro → granja → abatedouro), or any
     other hub kind present in the facility table, such as ``market``.
+    ``client_kinds`` limits the farms it serves by facility kind (e.g. egg
+    collection only at laying farms); None serves every farm.
     """
 
     hub_kind: str
     trucks_per_hub: int
     max_stops_per_day: int
+    client_kinds: tuple[str, ...] | None = None
 
 
 @dataclass(slots=True)
 class ModelParams:
+    # --- calendário -------------------------------------------------------
+    # Day 0 is the 1st of this month (see AgentModel.current_date); seasonal
+    # processes read the date, not the day count.
+    start_month: int = 1
+
     # --- SEIR intra-granja ------------------------------------------------
     beta: float = 3.2
     incubation_days: float = 4.0
@@ -75,7 +83,9 @@ class ModelParams:
 
     # --- fômites (caminhões) ---------------------------------------------
     # Facility kinds that become farms; every other kind may be a fleet hub.
-    farm_kinds: tuple[str, ...] = ("farm", "producer")
+    # "farm_layer"/"farm_broiler" are postura/corte (see FarmAgent.production);
+    # "farm" and "producer" are farms of unknown production type.
+    farm_kinds: tuple[str, ...] = ("farm", "producer", "farm_layer", "farm_broiler")
     # Illustrative defaults, to be calibrated against real fleet data.
     fleets: tuple[FleetSpec, ...] = (
         FleetSpec("feed_mill", trucks_per_hub=3, max_stops_per_day=4),
@@ -157,6 +167,7 @@ class ParamSpec:
         return _FIELD_TYPES[self.name].__name__
 
 
+_CALENDAR = "Calendário"
 _SEIR = "SEIR intra-granja"
 _SURVEILLANCE = "Vigilância e reação"
 _BIRDS = "Aves silvestres"
@@ -169,6 +180,7 @@ _POP = "MAPA, POP Postos Fixos e Equipes Volantes — IAAP e DNC, v1.0, nov/2023
 
 # In the interface's group order.
 PARAM_SPECS: tuple[ParamSpec, ...] = (
+    ParamSpec("start_month", "Mês de início da simulação", _CALENDAR, 1, 12, 1),
     ParamSpec("beta", "Taxa de transmissão (β)", _SEIR, 0.5, 5.0, 0.1),
     ParamSpec("incubation_days", "Período de incubação", _SEIR, 1, 14, 1, "dias"),
     ParamSpec("infectious_period_days", "Período infeccioso", _SEIR, 1, 10, 1, "dias"),

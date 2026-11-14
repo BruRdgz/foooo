@@ -284,6 +284,7 @@ def add_simulation_routes(app, session: SimulationSession) -> None:
         model, p = session.model, session.model.params
         return {
             "day": model.day_count,
+            "date": model.current_date.isoformat(),
             "seed": session.seed,
             "synthetic_facilities": session.synthetic,
             "healthy_farms": model.healthy_farms,

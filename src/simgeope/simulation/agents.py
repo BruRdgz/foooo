@@ -148,6 +148,12 @@ ZONE_RINGS = ("perifoco", "vigilancia", "protecao")
 DISINFECTION_RINGS = ("perifoco", "vigilancia")
 # Hub kind whose trucks carry live birds to slaughter, after a clinical exam.
 SLAUGHTER_HUB_KIND = "slaughterhouse"
+# Hub kind whose trucks collect eggs at laying farms (entreposto de ovos).
+EGG_HUB_KIND = "egg_grading"
+# Facility kinds of farms with a known production type.
+LAYER_FARM_KIND = "farm_layer"  # postura
+BROILER_FARM_KIND = "farm_broiler"  # corte
+FARM_PRODUCTION = {LAYER_FARM_KIND: "postura", BROILER_FARM_KIND: "corte"}
 
 
 class FarmAgent(Agent):
@@ -214,6 +220,11 @@ class FarmAgent(Agent):
     @property
     def road_node(self) -> int | None:
         return self.facility.road_node
+
+    @property
+    def production(self) -> str | None:
+        """"postura", "corte", or None when the facility kind does not say."""
+        return FARM_PRODUCTION.get(self.facility.kind)
 
     @property
     def status(self) -> str:

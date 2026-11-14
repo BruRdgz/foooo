@@ -4,3 +4,7 @@ __pycache__/
 .pytest_cache/
 data/
 *.pyc
+
+# Professor data dumps (official sources, contain personal data); see docs/FONTES_DADOS.md
+RECOLHIMENTO DE DADOS-*/
+Dados para simulação -*/

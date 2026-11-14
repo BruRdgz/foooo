@@ -66,6 +66,8 @@ class FarmDay(NamedTuple):
     detection_day: int
     zone: str | None
     focus: bool
+    # Birds placed in the current flock: pop_total, less while restocking.
+    housed: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +107,7 @@ class DaySnapshot:
                     farm.detection_day,
                     farm.zone,
                     farm.focus,
+                    farm.housed,
                 )
                 for farm in model.farms
             ),

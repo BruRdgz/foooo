@@ -44,6 +44,12 @@ class ModelParams:
     detection_time_max: int = 7
     reaction_time_max: int = 3
     generation_interval_days: int = 5
+    # Passive surveillance (SRN): besides the drawn detection day, a farm is
+    # notified as a suspected case once its deaths over the last window reach
+    # this share of the housed flock, whichever comes first.
+    mortality_notification: int = 1  # 0/1
+    mortality_alert_pct: float = 10.0
+    mortality_alert_window_days: int = 3
 
     # --- aves silvestres (SIR com chegada e partida migratória) ----------
     # Illustrative defaults for a demonstrative scenario, not field estimates.
@@ -145,22 +151,29 @@ class ModelParams:
     biosecurity_boost_amount: float = 20.0
     biosecurity_investment_cost: float = 5000.0
 
-    # --- protocolo oficial de trânsito (MAPA, POP IAAP/DNC, nov/2023) -----
-    # Off by default. Only the 3 km perifoco radius comes from the POP; the
-    # other values are assumptions pending confirmation (docs/PROTOCOLO_OFICIAL.md).
+    # --- protocolo oficial (MAPA: POP de trânsito nov/2023 e Plano de -----
+    # Contingência IAAP/DNC jun/2023). Off by default; sources and the
+    # remaining assumptions are in PARAM_SPECS and docs/PROTOCOLO_OFICIAL.md.
     protocol_enabled: int = 0  # 0/1
-    confirmation_days: int = 2
+    confirmation_days: int = 4
     auto_depopulation: int = 1  # 0/1
+    # Radii are measured from the focus (3 + 7 = 10, 10 + 15 = 25 km).
     perifocus_radius_km: float = 3.0
-    # Radii are measured from the focus: the POP's 7 km and 15 km areas are
-    # read as rings beyond the previous one (3 + 7 = 10, 10 + 15 = 25).
     surveillance_radius_km: float = 10.0
     protection_radius_km: float = 25.0
     standstill_days: int = 7
     zone_disinfection_prob: float = 0.95
     zone_release_days: int = 28
+    # Intervals between active-surveillance inspections in each ring; the
+    # names predate the periodic visits.
     perifocus_detection_days: int = 3
     surveillance_detection_days: int = 7
+    # After a cull: fallow, then a partial restocking under periodic
+    # inspection, then full capacity.
+    fallow_days: int = 30
+    restock_pct: float = 20.0
+    restock_monitoring_days: int = 60
+    restock_inspection_days: int = 7
 
 
 _FIELD_TYPES = get_type_hints(ModelParams)
@@ -204,8 +217,12 @@ _FOMITES = "Fômites (caminhões)"
 _MARKETS = "Produção e mercados"
 _RISK = "Camada de risco"
 _ECONOMY = "Intervenções e economia"
-_PROTOCOL = "Protocolo oficial (MAPA POP 2023)"
+_PROTOCOL = "Protocolo oficial (MAPA 2023)"
+# Official sources, cited by the short names below in ParamSpec.source.
 _POP = "MAPA, POP Postos Fixos e Equipes Volantes — IAAP e DNC, v1.0, nov/2023"
+_PLAN = "Plano de Contingência IAAP/DNC (MAPA, Parte Específica, v1.0, jun/2023)"
+_FICHA = "Ficha Técnica IA (MAPA/DSA, jul/2023)"
+_INVESTIGATIONS = "planilha MAPA de investigações com coleta de amostras, 2022–2025"
 
 # In the interface's group order.
 PARAM_SPECS: tuple[ParamSpec, ...] = (
@@ -236,6 +253,36 @@ PARAM_SPECS: tuple[ParamSpec, ...] = (
         10,
         1,
         "dias",
+    ),
+    ParamSpec(
+        "mortality_notification",
+        "Notificar por mortalidade (caso suspeito de SRN)",
+        _SURVEILLANCE,
+        0,
+        1,
+        1,
+        source=f"{_FICHA}, p. 3: caso suspeito de SRN, notificação imediata ao SVO",
+    ),
+    ParamSpec(
+        "mortality_alert_pct",
+        "Mortalidade que caracteriza a suspeita",
+        _SURVEILLANCE,
+        1,
+        100,
+        1,
+        "%",
+        source=f"{_FICHA}, p. 3: 'mortalidade maior ou igual a 10% em até 72 "
+        "horas' em estabelecimento comercial",
+    ),
+    ParamSpec(
+        "mortality_alert_window_days",
+        "Janela da mortalidade",
+        _SURVEILLANCE,
+        1,
+        14,
+        1,
+        "dias",
+        source=f"{_FICHA}, p. 3: 'em até 72 horas' (3 dias)",
     ),
     ParamSpec(
         "quarantine_release_days",
@@ -428,12 +475,13 @@ PARAM_SPECS: tuple[ParamSpec, ...] = (
     ),
     ParamSpec(
         "protocol_enabled",
-        "Aplicar protocolo oficial de trânsito",
+        "Aplicar o protocolo oficial",
         _PROTOCOL,
         0,
         1,
         1,
-        source=_POP,
+        source=f"{_POP} (trânsito); {_PLAN} (foco, áreas, vigilância e "
+        "repovoamento)",
     ),
     ParamSpec(
         "confirmation_days",
@@ -443,20 +491,20 @@ PARAM_SPECS: tuple[ParamSpec, ...] = (
         14,
         1,
         "dias",
-        assumption=True,
-        source="suposição: prazo do RT-PCR após a notificação; o POP não informa",
+        source=f"{_INVESTIGATIONS}: mediana de 4 dias (quartis 3–6) entre o "
+        "atendimento inicial e o diagnóstico conclusivo em 172 focos de IAAP "
+        "(2 com datas inválidas excluídos; 165 dos 174 em aves silvestres); mede "
+        "atendimento → diagnóstico, não notificação → confirmação",
     ),
     ParamSpec(
         "auto_depopulation",
-        "Despovoamento automático do foco",
+        "Despovoamento do foco na confirmação",
         _PROTOCOL,
         0,
         1,
         1,
-        assumption=True,
-        source="suposição: política brasileira de sacrifício sanitário para IAAP "
-        "em plantéis comerciais; o POP só diz que a saída do foco é para "
-        "destruição (p. 2)",
+        source=f"{_PLAN}, §7.1, p. 14: 'Depopulação imediata de todas as aves "
+        "existentes na unidade epidemiológica'",
     ),
     ParamSpec(
         "perifocus_radius_km",
@@ -466,7 +514,8 @@ PARAM_SPECS: tuple[ParamSpec, ...] = (
         10,
         0.5,
         "km",
-        source="POP MAPA 2023, p. 3: Perifoco (área de 3 km)",
+        source=f"{_PLAN}, §7, p. 13: área perifocal de 3 km ao redor do foco; "
+        "POP MAPA 2023, p. 3",
     ),
     ParamSpec(
         "surveillance_radius_km",
@@ -476,9 +525,8 @@ PARAM_SPECS: tuple[ParamSpec, ...] = (
         50,
         0.5,
         "km",
-        assumption=True,
-        source="suposição: a 'área de 7 km' (p. 3) lida como anel além do "
-        "perifoco, como na IN 32/2002 (3 + 7 = 10 km)",
+        source=f"{_PLAN}, §7, p. 13: 7 km a partir da área perifocal, "
+        "'perfazendo um total de 10 km'",
     ),
     ParamSpec(
         "protection_radius_km",
@@ -488,9 +536,8 @@ PARAM_SPECS: tuple[ParamSpec, ...] = (
         100,
         0.5,
         "km",
-        assumption=True,
-        source="suposição: a 'área de 15 km' (p. 3) lida como anel adicional "
-        "(10 + 15 = 25 km); leitura alternativa: raio de 15 km",
+        source=f"{_PLAN}, §7, p. 13: 15 km a partir dos limites da área de "
+        "vigilância, 'perfazendo um total de 25 km'",
     ),
     ParamSpec(
         "standstill_days",
@@ -502,7 +549,8 @@ PARAM_SPECS: tuple[ParamSpec, ...] = (
         "dias",
         assumption=True,
         source="suposição: o POP manda interromper o trânsito 'em um momento "
-        "inicial' (p. 2) sem dizer por quanto tempo",
+        "inicial' (p. 2) sem dizer por quanto tempo; o Plano (§7.2–7.3) só "
+        "condiciona as saídas à autorização do SVO",
     ),
     ParamSpec(
         "zone_disinfection_prob",
@@ -524,30 +572,75 @@ PARAM_SPECS: tuple[ParamSpec, ...] = (
         1,
         "dias",
         assumption=True,
-        source="suposição: 28 dias após despovoar e limpar o foco, como na OMSA; "
-        "o POP não define o critério de liberação",
+        source="suposição: o Plano mantém as medidas 'até a fase de conclusão do "
+        "foco' (§7.2–7.3, p. 14–15) e encerra o foco sem mais evidência do "
+        "agente (§14, p. 38), sem prazo; 28 dias = dois períodos de incubação "
+        "de até 14 dias (Ficha Técnica IA), como na OMSA",
     ),
     ParamSpec(
         "perifocus_detection_days",
-        "Prazo da vigilância ativa no perifoco",
+        "Intervalo das visitas de vigilância no perifoco",
         _PROTOCOL,
-        0,
+        1,
         30,
         1,
         "dias",
-        assumption=True,
-        source="suposição: prazo da visita de vigilância ativa; o POP não informa",
+        source=f"{_PLAN}, §7.2, p. 14: investigação em todas as propriedades com "
+        "aves 'a cada 3 dias' até a conclusão do foco",
     ),
     ParamSpec(
         "surveillance_detection_days",
-        "Prazo da vigilância ativa na área de vigilância",
+        "Intervalo das visitas de vigilância na área de vigilância",
         _PROTOCOL,
-        0,
+        1,
         30,
         1,
         "dias",
-        assumption=True,
-        source="suposição: prazo da visita de vigilância ativa; o POP não informa",
+        source=f"{_PLAN}, §7.3, p. 15: investigação em todas as propriedades com "
+        "aves 'a cada 7 dias' até a conclusão do foco",
+    ),
+    ParamSpec(
+        "fallow_days",
+        "Vazio sanitário após o abate",
+        _PROTOCOL,
+        0,
+        180,
+        1,
+        "dias",
+        source=f"{_PLAN}, §10, p. 29: repovoamento só 'no mínimo, 30 dias depois "
+        "dos procedimentos de desinfecção' (contados do abate no modelo)",
+    ),
+    ParamSpec(
+        "restock_pct",
+        "Repovoamento inicial",
+        _PROTOCOL,
+        1,
+        100,
+        1,
+        "% da capacidade",
+        source=f"{_PLAN}, §11, p. 33: repovoamento com, 'no máximo, 20% da "
+        "capacidade de alojamento'",
+    ),
+    ParamSpec(
+        "restock_monitoring_days",
+        "Monitoramento antes do repovoamento total",
+        _PROTOCOL,
+        0,
+        180,
+        1,
+        "dias",
+        source=f"{_PLAN}, §11, p. 33: aves 'controladas durante 60 dias' e "
+        "depois 'repovoamento total'",
+    ),
+    ParamSpec(
+        "restock_inspection_days",
+        "Intervalo das inspeções no repovoamento",
+        _PROTOCOL,
+        1,
+        30,
+        1,
+        "dias",
+        source=f"{_PLAN}, §11, p. 33: 'inspeções semanais do SVO'",
     ),
 )
 
@@ -610,6 +703,12 @@ class ParamPreset:
 # fleet) on a grid-road test world and once on the Pernambuco world:
 # "surto_sustentado" kept >= 5 infected farms at day 120 in 8/10 and 7/10
 # seeds, and in "cadeia_logistica" trucks caused most farm introductions.
+# Rerun with the mortality suspicion rule (Ficha Técnica IA) on a 3 km road
+# grid over the real municipalities: "surto_sustentado" kept >= 5 infected
+# farms at day 120 in 5/10 seeds (6/10 with the rule off); the rule made
+# 2.3 of its 34.2 notifications per run, since the drawn detection day
+# usually comes first. "protocolo_mapa" ended every outbreak before day 120
+# (6.1 foci per run, the last infection on day 33.8 on average).
 _SUSTAINED_OUTBREAK = {
     "local_spread_prob": 25.0,
     "local_spread_radius_km": 6.0,
@@ -623,23 +722,28 @@ PARAM_PRESETS: tuple[ParamPreset, ...] = (
         "surto_sustentado",
         "Surto sustentado",
         "Valores ilustrativos, não calibrados: transmissão vizinha mais forte e "
-        "de maior alcance, biosseguridade menor e detecção mais lenta mantêm o "
-        "surto ativo por meses na maioria das sementes.",
+        "de maior alcance, biosseguridade menor e detecção espontânea mais "
+        "lenta mantêm o surto ativo por meses em cerca de metade das sementes. "
+        "A notificação por mortalidade de 10% em 72 h continua valendo, mas "
+        "raramente vem antes.",
         _SUSTAINED_OUTBREAK,
     ),
     # The sustained outbreak with the protocol on, so its effect is visible.
     ParamPreset(
         "protocolo_mapa",
         "Protocolo oficial (MAPA)",
-        "O surto sustentado com o protocolo de trânsito do POP MAPA 2023 (IAAP "
-        "e DNC): confirmação e despovoamento do foco, perifoco, vigilância e "
-        "proteção, interrupção inicial do trânsito, desinfecção de veículos e "
-        "vigilância ativa. Só o raio do perifoco vem do POP; os demais valores "
+        "O surto sustentado com o protocolo oficial do MAPA (POP de trânsito, "
+        "nov/2023, e Plano de Contingência IAAP/DNC, jun/2023): confirmação em 4 "
+        "dias (mediana das investigações do MAPA), despovoamento imediato do "
+        "foco, perifoco de 3 km, vigilância até 10 km e proteção até 25 km, "
+        "visitas a cada 3 e 7 dias, vazio sanitário de 30 dias e repovoamento "
+        "com 20% monitorado por 60 dias. A duração da interrupção inicial do "
+        "trânsito, a eficácia da desinfecção e o prazo de liberação das áreas "
         "são suposições sinalizadas, a confirmar com a ADAGRO.",
         _SUSTAINED_OUTBREAK
         | {
             "protocol_enabled": 1,
-            "confirmation_days": 2,
+            "confirmation_days": 4,
             "auto_depopulation": 1,
             "perifocus_radius_km": 3.0,
             "surveillance_radius_km": 10.0,
@@ -649,6 +753,10 @@ PARAM_PRESETS: tuple[ParamPreset, ...] = (
             "zone_release_days": 28,
             "perifocus_detection_days": 3,
             "surveillance_detection_days": 7,
+            "fallow_days": 30,
+            "restock_pct": 20.0,
+            "restock_monitoring_days": 60,
+            "restock_inspection_days": 7,
         },
     ),
     ParamPreset(

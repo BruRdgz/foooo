@@ -6,7 +6,7 @@ import csv
 import math
 import warnings
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import astuple, dataclass, fields, replace
 from datetime import date, timedelta
 from itertools import takewhile
@@ -22,9 +22,11 @@ from simgeope.world.exceptions import NoRoadNearbyError, WorldDataMissingError
 from simgeope.world.facilities import Facility, FacilityIndex, snap_facility
 
 from .agents import (
+    BROILER_FARM_KIND,
     CLINICAL_SIGNS_MIN_BIRDS,
     FARM_STATUSES,
     HUB_PRODUCTS,
+    LAYER_FARM_KIND,
     ZONE_RINGS,
     BirdAgent,
     FarmAgent,
@@ -95,6 +97,39 @@ LOT_TALLIES = (
 )
 # Unit of `Lot.quantity` per product, as shown in event details.
 LOT_UNITS = {"ovos": "dúzias de ovos", "aves": "aves"}
+
+# Synthetic poultry population anchored in official data; sources and
+# limitations in docs/FONTES_DADOS.md.
+# IBGE POG (table 7524), PE, 1st quarter 2025: establishments with at least
+# 10 thousand laying hens, and their hens.
+POG_LAYER_ESTABLISHMENTS = 62
+POG_LAYER_HENS = 13_352_483
+# ADAGRO list of registered poultry farms, February 2022. It does not give
+# the production type; assumption: entries beyond the POG's layer
+# establishments are broiler farms.
+ADAGRO_REGISTERED_FARMS = 267
+# IBGE PPM 2024 (table 3939), PE: galináceos total minus galinhas. It also
+# counts roosters, pullets, chicks and backyard flocks, so the broiler farm
+# population derived from it is an upper bound.
+PPM_BROILER_PROXY_2024 = 52_396_226
+OFFICIAL_FARM_COUNTS = {
+    LAYER_FARM_KIND: POG_LAYER_ESTABLISHMENTS,
+    BROILER_FARM_KIND: ADAGRO_REGISTERED_FARMS - POG_LAYER_ESTABLISHMENTS,
+}
+# Every farm of a type holds that type's mean; no source gives the spread.
+OFFICIAL_FARM_POPULATION = {
+    LAYER_FARM_KIND: round(POG_LAYER_HENS / POG_LAYER_ESTABLISHMENTS),
+    BROILER_FARM_KIND: round(
+        PPM_BROILER_PROXY_2024 / OFFICIAL_FARM_COUNTS[BROILER_FARM_KIND]
+    ),
+}
+# Farms of unknown production type keep the earlier illustrative demo size.
+UNKNOWN_TYPE_FARM_POPULATION = 5_000
+DEFAULT_FARM_POPULATION = {
+    "farm": UNKNOWN_TYPE_FARM_POPULATION,
+    "producer": UNKNOWN_TYPE_FARM_POPULATION,
+    **OFFICIAL_FARM_POPULATION,
+}
 
 
 class Event(NamedTuple):
@@ -341,15 +376,32 @@ class AgentModel(WorldModel):
         return truck
 
     # ===================================================== scenario setup
-    def add_farms_from_world(self, *, pop_total: int = 5_000) -> int:
+    def add_farms_from_world(
+        self, *, pop_total: int | Mapping[str, int] = DEFAULT_FARM_POPULATION
+    ) -> int:
+        """Register every world facility of a farm kind; returns how many.
+
+        ``pop_total`` is one population for every farm or one per facility
+        kind; a farm kind missing from the mapping is an error, checked
+        before any farm is added.
+        """
         if self.world.facilities is None:
             raise RuntimeError("World has no FacilityIndex loaded")
-        added = 0
-        for facility in self.world.facilities.facilities:
-            if facility.kind in self.params.farm_kinds:
-                self.add_farm(facility, pop_total=pop_total)
-                added += 1
-        return added
+        farms = [
+            facility
+            for facility in self.world.facilities.facilities
+            if facility.kind in self.params.farm_kinds
+        ]
+        if not isinstance(pop_total, int):
+            unknown = ", ".join(sorted({f.kind for f in farms} - set(pop_total)))
+            if unknown:
+                raise ValueError(f"No farm population for kinds: {unknown}")
+        for facility in farms:
+            population = (
+                pop_total if isinstance(pop_total, int) else pop_total[facility.kind]
+            )
+            self.add_farm(facility, pop_total=population)
+        return len(farms)
 
     def add_hubs_from_world(self) -> int:
         """Register every world facility whose kind is a configured fleet base."""
@@ -1187,6 +1239,36 @@ DEMO_POULTRY_POLES = (
 )
 # Standard deviation of synthetic facility positions around a pole centre.
 POLE_SIGMA_KM = 4.0
+# Draws allowed per wanted facility, on average, before giving up on the rest.
+PLACEMENT_ATTEMPTS_PER_FACILITY = 200
+# Facility IDs of official-data farms: "P0001" (postura), "C0001" (corte).
+OFFICIAL_FARM_ID_PREFIXES = {LAYER_FARM_KIND: "P", BROILER_FARM_KIND: "C"}
+
+# Per-municipality poultry table built by tools/build_reference_data.py from
+# IBGE and ADAGRO files, with aggregate counts only (docs/FONTES_DADOS.md).
+REFERENCE_TABLE = (
+    Path(__file__).resolve().parent / "reference" / "producao_municipios_pe.csv"
+)
+# Reference column whose head counts weigh each farm kind's municipalities.
+FARM_KIND_WEIGHT_COLUMNS = {
+    LAYER_FARM_KIND: "galinhas_2024",
+    BROILER_FARM_KIND: "corte_proxy_2024",
+}
+
+# Draws a metric point and, when known, the code of its municipality.
+PointDraw = Callable[[], tuple[Point, str | None] | None]
+
+
+def reference_farm_weights(
+    path: str | Path = REFERENCE_TABLE,
+) -> dict[str, dict[str, int]]:
+    """Per farm kind, the reference weight of each municipality code."""
+    with Path(path).open(encoding="utf-8", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    return {
+        kind: {row["codigo_ibge"]: int(row[column]) for row in rows}
+        for kind, column in FARM_KIND_WEIGHT_COLUMNS.items()
+    }
 
 
 def install_synthetic_facilities(
@@ -1204,10 +1286,10 @@ def install_synthetic_facilities(
     Samples `n` farms plus ``hubs`` (kind -> count, e.g. feed mills) inside the
     PE state polygon. With ``poles`` (municipality names), ``pole_fraction`` of
     the farms and every hub are drawn around those municipalities (Gaussian,
-    ``POLE_SIGMA_KM``); the rest are uniform by area. With roads, each sample
-    is snapped and rejected unless its node is in the largest strongly
-    connected road component, so all facilities can reach each other. The
-    result is assigned to ``world.facilities``. Intended for tests and demos.
+    ``POLE_SIGMA_KM``); the rest are uniform by area. Placement follows
+    ``_place_facilities``. The result is assigned to ``world.facilities``.
+    Intended for tests and demos; ``install_official_facilities`` places
+    farms by official data.
     """
     if not 0 <= pole_fraction <= 1:
         raise ValueError("pole_fraction must be within [0, 1]")
@@ -1224,35 +1306,161 @@ def install_synthetic_facilities(
         sp.geometry_to_metric(by_name[name].geometry_wgs84).representative_point()
         for name in poles
     ]
+
+    def at_pole() -> tuple[Point, None]:
+        centre = centres[int(rng.integers(len(centres)))]
+        sigma = POLE_SIGMA_KM * 1000.0
+        offset = rng.normal(0, sigma), rng.normal(0, sigma)
+        return Point(centre.x + offset[0], centre.y + offset[1]), None
+
+    def anywhere() -> tuple[Point, None] | None:
+        point = sample_point_in(state_metric, rng.uniform, attempts=1)
+        return None if point is None else (point, None)
+
     clustered = round(n * pole_fraction) if centres else 0
-    wanted = [(f"f{i + 1:04d}", kind, i < clustered) for i in range(n)]
+    wanted: list[tuple[str, str, PointDraw]] = [
+        (f"f{i + 1:04d}", kind, at_pole if i < clustered else anywhere)
+        for i in range(n)
+    ]
     for hub_kind, count in sorted((hubs or {}).items()):
         wanted += [
-            (f"{hub_kind}-{i + 1:02d}", hub_kind, bool(centres)) for i in range(count)
+            (f"{hub_kind}-{i + 1:02d}", hub_kind, at_pole if centres else anywhere)
+            for i in range(count)
         ]
+    return _place_facilities(world, wanted)
+
+
+def install_official_facilities(
+    world,
+    fleets: Sequence[FleetSpec],
+    *,
+    farms: Mapping[str, int] = OFFICIAL_FARM_COUNTS,
+    hubs_per_fleet: int = 2,
+    weights: Mapping[str, Mapping[str, int]] | None = None,
+    seed: int | None = 42,
+):
+    """Attach synthetic farms and hubs placed by official municipal data.
+
+    ``farms`` maps farm kinds to counts. Each farm's municipality is drawn
+    with probability proportional to its kind's weight there (``weights``,
+    default ``reference_farm_weights()``) and its point uniformly by area
+    inside that municipality. Every hub kind in ``fleets`` gets
+    ``hubs_per_fleet`` hubs, drawn the same way with the summed weights of
+    the placed farm kinds its fleets serve: an assumption, as there is no
+    open list of feed mills, slaughterhouses or egg-grading centres.
+    Placement follows ``_place_facilities``.
+
+    Raises ValueError before placing anything when a farm kind has no
+    weights, a fleet serves none of the placed kinds, or the world lacks a
+    municipality with positive weight: the data would not describe it.
+    """
+    weights = reference_farm_weights() if weights is None else weights
+    if hubs_per_fleet < 0 or any(count < 0 for count in farms.values()):
+        raise ValueError("Facility counts must be nonnegative")
+    unweighted = sorted(set(farms) - set(weights))
+    if unweighted:
+        raise ValueError(f"No municipal weights for farm kinds: {unweighted}")
+
+    served_by: dict[str, set[str]] = {}
+    for spec in fleets:
+        served = set(farms) if spec.client_kinds is None else set(spec.client_kinds)
+        served_by.setdefault(spec.hub_kind, set()).update(served & set(farms))
+    idle = sorted(hub_kind for hub_kind, served in served_by.items() if not served)
+    if idle:
+        raise ValueError(f"Fleets serve none of the placed farm kinds: {idle}")
+    site_weights: dict[str, dict[str, int]] = {
+        kind: {code: w for code, w in weights[kind].items() if w > 0}
+        for kind in farms
+    }
+    for hub_kind, served in sorted(served_by.items()):
+        summed: Counter[str] = Counter()
+        for kind in sorted(served):
+            summed.update(site_weights[kind])
+        site_weights[hub_kind] = dict(summed)
+    empty = sorted(kind for kind, sites in site_weights.items() if not sites)
+    if empty:
+        raise ValueError(f"No municipality has a positive weight for: {empty}")
+
+    admin = world.administrative
+    sp = admin.spatial
+    by_code = {m.code: m for m in admin.municipalities}
+    needed = set().union(*site_weights.values())
+    missing = sorted(needed - set(by_code))
+    if missing:
+        raise ValueError(
+            f"World lacks {len(missing)} municipalities of the reference data: "
+            f"{', '.join(missing[:5])}{', ...' if len(missing) > 5 else ''}"
+        )
+    metric = {
+        code: sp.geometry_to_metric(by_code[code].geometry_wgs84)
+        for code in sorted(needed)
+    }
+    rng = np.random.default_rng(seed)
+
+    def drawer(sites: Mapping[str, int]) -> PointDraw:
+        codes = sorted(sites)
+        cumulative = np.cumsum([sites[code] for code in codes])
+
+        def draw() -> tuple[Point, str] | None:
+            pick = rng.uniform(0.0, float(cumulative[-1]))
+            index = int(np.searchsorted(cumulative, pick, side="right"))
+            code = codes[min(index, len(codes) - 1)]
+            point = sample_point_in(metric[code], rng.uniform, attempts=1)
+            return None if point is None else (point, code)
+
+        return draw
+
+    wanted: list[tuple[str, str, PointDraw]] = []
+    for kind, count in sorted(farms.items()):
+        draw = drawer(site_weights[kind])
+        prefix = OFFICIAL_FARM_ID_PREFIXES.get(kind, f"{kind}-")
+        wanted += [(f"{prefix}{i + 1:04d}", kind, draw) for i in range(count)]
+    for hub_kind in sorted(served_by):
+        draw = drawer(site_weights[hub_kind])
+        wanted += [
+            (f"{hub_kind}-{i + 1:02d}", hub_kind, draw) for i in range(hubs_per_fleet)
+        ]
+    return _place_facilities(world, wanted)
+
+
+def _place_facilities(
+    world, wanted: Sequence[tuple[str, str, PointDraw]]
+) -> FacilityIndex:
+    """Place each wanted (id, kind, draw) in order; attach the index to the world.
+
+    A draw outside the state polygon is redrawn. With roads, so is one that
+    does not snap to a node of the largest strongly connected road component,
+    so all facilities can reach each other. After
+    ``PLACEMENT_ATTEMPTS_PER_FACILITY`` draws per wanted facility the rest
+    are left out with a warning.
+    """
+    admin = world.administrative
+    sp = admin.spatial
+    state_metric = sp.geometry_to_metric(admin.state_geometry_wgs84)
     connected = (
         world.roads.largest_component_nodes() if world.roads is not None else None
     )
 
     facilities: list[Facility] = []
     attempts = 0
-    max_attempts = len(wanted) * 200
+    max_attempts = len(wanted) * PLACEMENT_ATTEMPTS_PER_FACILITY
     while len(facilities) < len(wanted) and attempts < max_attempts:
         attempts += 1
-        facility_id, facility_kind, at_pole = wanted[len(facilities)]
-        if at_pole:
-            centre = centres[int(rng.integers(len(centres)))]
-            sigma = POLE_SIGMA_KM * 1000.0
-            mx, my = centre.x + rng.normal(0, sigma), centre.y + rng.normal(0, sigma)
-        else:
-            point = sample_point_in(state_metric, rng.uniform, attempts=1)
-            if point is None:
-                continue
-            mx, my = point.x, point.y
-        if not state_metric.contains(Point(mx, my)):
+        facility_id, facility_kind, draw = wanted[len(facilities)]
+        drawn = draw()
+        if drawn is None:
             continue
-        lon, lat = sp.unproject((mx, my))
-        fac = Facility(id=facility_id, kind=facility_kind, lon=lon, lat=lat)
+        point, code = drawn
+        if not state_metric.contains(point):
+            continue
+        lon, lat = sp.unproject((point.x, point.y))
+        fac = Facility(
+            id=facility_id,
+            kind=facility_kind,
+            lon=lon,
+            lat=lat,
+            municipality_code=code,
+        )
         if world.roads is not None:
             try:
                 fac = snap_facility(
@@ -1273,7 +1481,7 @@ def install_synthetic_facilities(
         )
     if len(facilities) < len(wanted):
         missing = ", ".join(entry[0] for entry in wanted[len(facilities) :])
-        warnings.warn(f"Synthetic facilities not placed: {missing}", stacklevel=2)
+        warnings.warn(f"Synthetic facilities not placed: {missing}", stacklevel=3)
 
     world.facilities = FacilityIndex(facilities, metric_crs=world.config.metric_crs)
     return world.facilities

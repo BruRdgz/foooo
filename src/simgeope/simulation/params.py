@@ -92,11 +92,11 @@ class ModelParams:
     # "farm_layer"/"farm_broiler" are postura/corte (see FarmAgent.production);
     # "farm" and "producer" are farms of unknown production type.
     farm_kinds: tuple[str, ...] = ("farm", "producer", "farm_layer", "farm_broiler")
-    # Illustrative defaults, to be calibrated against real fleet data. Product
+    # Illustrative defaults, to be calibrated against real fleet data. Feed
+    # reaches every farm; live birds go to slaughter from broiler farms and,
+    # for worlds without production types, from farms of unknown type. Product
     # fleets (slaughterhouse: live birds; egg_grading: eggs) also record a lot
-    # per farm collection (see agents.Lot). Slaughter trucks serve broiler
-    # farms and farms of unknown type, so worlds without farm_layer/
-    # farm_broiler keep their behaviour. The egg fleet's trays and boxes
+    # per farm collection (see agents.Lot). The egg fleet's trays and boxes
     # returning through the entreposto are its fomite pathway (hub exchange).
     fleets: tuple[FleetSpec, ...] = (
         FleetSpec("feed_mill", trucks_per_hub=3, max_stops_per_day=4),
@@ -699,16 +699,20 @@ class ParamPreset:
 
 
 # Illustrative scenarios, not calibrated. Chosen from 120-day runs of seeds 1-10
-# with the demo's synthetic farms (120 farms around the demo poles, 2 hubs per
-# fleet) on a grid-road test world and once on the Pernambuco world:
-# "surto_sustentado" kept >= 5 infected farms at day 120 in 8/10 and 7/10
-# seeds, and in "cadeia_logistica" trucks caused most farm introductions.
-# Rerun with the mortality suspicion rule (Ficha Técnica IA) on a 3 km road
-# grid over the real municipalities: "surto_sustentado" kept >= 5 infected
-# farms at day 120 in 5/10 seeds (6/10 with the rule off); the rule made
-# 2.3 of its 34.2 notifications per run, since the drawn detection day
+# with the earlier demo population (120 farms of 5,000 birds around the demo
+# poles, 2 hubs per fleet) on a grid-road test world and once on the
+# Pernambuco world: "surto_sustentado" kept >= 5 infected farms at day 120 in
+# 8/10 and 7/10 seeds, and in "cadeia_logistica" trucks caused most farm
+# introductions. Rerun with the mortality suspicion rule (Ficha Técnica IA) on
+# a 3 km road grid over the real municipalities: "surto_sustentado" kept >= 5
+# infected farms at day 120 in 5/10 seeds (6/10 with the rule off); the rule
+# made 2.3 of its 34.2 notifications per run, since the drawn detection day
 # usually comes first. "protocolo_mapa" ended every outbreak before day 120
 # (6.1 foci per run, the last infection on day 33.8 on average).
+# With the official-data population (docs/FONTES_DADOS.md: 267 farms of about
+# 215-256 thousand birds) on the Pernambuco world, "surto_sustentado" gave
+# 4/10, and in "cadeia_logistica" trucks caused 1 of 18 introductions after the
+# initial ones: the presets need recalibrating for that population.
 _SUSTAINED_OUTBREAK = {
     "local_spread_prob": 25.0,
     "local_spread_radius_km": 6.0,

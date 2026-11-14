@@ -149,20 +149,23 @@ def test_param_schema_covers_every_scalar_model_parameter(client):
         "Aves silvestres",
         "Transmissão local",
         "Fômites (caminhões)",
+        "Produção e mercados",
         "Camada de risco",
         "Intervenções e economia",
         "Protocolo oficial (MAPA POP 2023)",
     ]
     # Every entry says whether its value is an assumption and where it comes
-    # from; protocol values are cited or flagged as assumptions.
+    # from; protocol and production values are cited or flagged as assumptions.
+    sourced = {groups[-1], "Produção e mercados"}
     for spec in body["schema"]:
         assert type(spec["assumption"]) is bool
-        if spec["group"] != groups[-1]:
+        if spec["group"] not in sourced:
             assert (spec["assumption"], spec["source"]) == (False, None)
         elif spec["assumption"]:
             assert spec["source"].startswith("suposição: ")
         else:
-            assert spec["source"] and "POP" in spec["source"]
+            assert spec["source"]
+            assert "POP" in spec["source"] or spec["group"] != groups[-1]
     protocol = {s["name"]: s for s in body["schema"] if s["group"] == groups[-1]}
     assert not protocol["perifocus_radius_km"]["assumption"]
     assert protocol["surveillance_radius_km"]["assumption"]
@@ -449,6 +452,90 @@ def test_transmissions_window_paths_and_hub_ranking(chain):
             (h["id"], h["introductions"], h["source_farms"]) for h in body["hubs"]
         ] == ranking
     bad = client.get("/api/sim/transmissions", params={"from_day": 3, "to_day": 2})
+    assert bad.status_code == 422
+
+
+def test_lots_window_records_and_hub_tallies(two_way_world):
+    from simgeope.simulation.agents import Lot
+    from simgeope.world.facilities import Facility, FacilityIndex
+
+    two_way_world.facilities = FacilityIndex(
+        [
+            Facility("a", "slaughterhouse", -35.0, -8.0),
+            Facility("e", "egg_grading", -35.0, -8.0),
+            Facility("m", "feed_mill", -35.0, -8.0),
+            Facility("b", "producer", -34.98, -8.0),
+        ],
+        metric_crs=two_way_world.config.metric_crs,
+    )
+    params = ModelParams(
+        fleets=(
+            FleetSpec("slaughterhouse", 1, 1),
+            FleetSpec("egg_grading", 1, 1, ("farm_layer",)),  # no layer farm
+            FleetSpec("feed_mill", 1, 1),
+        ),
+        broiler_lot_birds=1000,
+    )
+    session = SimulationSession(two_way_world, params=params, seed=7, birds=0)
+    client = TestClient(create_app(two_way_world, simulation=session))
+
+    # The seeded farm b ships its first live-bird load, still hidden, on day 1.
+    client.post("/api/sim/step", json={"days": 1})
+    state = client.get("/api/sim/state").json()
+    assert state["lots"]["aves"]["exposed"] == {"lots": 1, "quantity": 1000.0}
+    assert state["lots"]["aves"]["mean_exposure_days"] is None
+    assert state["lots"] == client.get("/api/sim/history").json()[-1]["lots"]
+
+    client.post("/api/sim/step", json={"days": 2})
+    # Controlled lots: the endpoint only filters and serialises the model's.
+    session.model.lots = [
+        Lot(1, "b", "a", "a-truck-1", "aves", 1000.0, "hidden", "recalled", 3),
+        Lot(2, "b", "e", "e-truck-1", "ovos", 40.0, "healthy"),
+        Lot(2, "b", "a", "a-truck-1", "aves", 1000.0, "hidden", "outside_window", 3),
+        Lot(3, "b", "e", "e-truck-1", "ovos", 20.0, "hidden"),
+    ]
+    whole = client.get("/api/sim/lots").json()
+    assert whole["lots"][0] == {
+        "day": 1,
+        "farm_id": "b",
+        "hub_id": "a",
+        "truck_id": "a-truck-1",
+        "product": "aves",
+        "quantity": 1000.0,
+        "farm_status": "hidden",
+        "trace": "recalled",
+        "trace_day": 3,
+        "exposed": True,
+        "exposure_days": 2,
+    }
+    assert [lot["exposure_days"] for lot in whole["lots"]] == [2, None, None, None]
+    # Product hubs only (no feed mill), most exposed lots first.
+    assert whole["hubs"][0] == {
+        "id": "a",
+        "name": None,
+        "kind": "slaughterhouse",
+        "product": "aves",
+        "lon": -35.0,
+        "lat": -8.0,
+        "lots": 2,
+        "quantity": 2000.0,
+        "exposed_lots": 2,
+        "exposed_quantity": 2000.0,
+        "recalled_lots": 1,
+        "outside_window_lots": 1,
+    }
+    for query, days, ranking in [
+        ({}, [1, 2, 2, 3], [("a", 2, 2), ("e", 2, 1)]),
+        ({"from_day": 2, "to_day": 2}, [2, 2], [("a", 1, 1), ("e", 1, 0)]),
+        ({"from_day": 3}, [3], [("e", 1, 1), ("a", 0, 0)]),
+        ({"from_day": 9, "to_day": 20}, [], [("a", 0, 0), ("e", 0, 0)]),
+    ]:
+        body = client.get("/api/sim/lots", params=query).json()
+        assert [lot["day"] for lot in body["lots"]] == days
+        assert [
+            (h["id"], h["lots"], h["exposed_lots"]) for h in body["hubs"]
+        ] == ranking
+    bad = client.get("/api/sim/lots", params={"from_day": 3, "to_day": 2})
     assert bad.status_code == 422
 
 

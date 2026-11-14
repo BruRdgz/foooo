@@ -16,10 +16,12 @@ from typing import TYPE_CHECKING, NamedTuple
 import numpy as np
 from scipy.spatial import cKDTree
 from shapely.geometry import Point
+from shapely.ops import nearest_points
 
 from simgeope.mesa_adapter import WorldModel
 from simgeope.world.exceptions import NoRoadNearbyError, WorldDataMissingError
 from simgeope.world.facilities import Facility, FacilityIndex, snap_facility
+from simgeope.world.spatial import lon_lat
 
 from .agents import (
     FARM_STATUSES,
@@ -74,6 +76,31 @@ FLOCK_SPREAD_M = 300.0
 # Width given to mapped water lines (rivers, canals, coastline) when weighing
 # them against water polygons as bird arrival sites.
 NOMINAL_WATERLINE_WIDTH_M = 50.0
+# Daily migratory flock arrival rate by calendar month (January first), as a
+# share of migratory_flocks_per_day. It follows the boreal-winter shorebirds
+# and terns, the IAAP alert species of the MAPA contingency plan (§13.1):
+# - May-Jul 0: Arctic breeding season. The few birds counted then at Coroa do
+#   Avião are oversummering young that stayed, not new arrivals (Azevedo Jr.
+#   1992; CEMAVE summary: only young and non-breeders stay in Jun-Jul).
+# - Aug and Apr 0.25: first and last months of the season at Coroa do Avião
+#   ("agosto a abril", Azevedo Jr. 1992); CEMAVE: they arrive "geralmente em
+#   setembro" and stay "até abril".
+# - Sep-Nov 1: arrival peak. Every season maximum at Coroa do Avião was counted
+#   30 Oct-3 Nov 1989 and Sterna hirundo peaks in October (Azevedo Jr. 1992).
+# - Dec-Mar 0.5: wintering presence is documented (Azevedo Jr. 1992; about
+#   3,000 Calidris pusilla at Salgadinho, Olinda, in March 1989) but no
+#   monthly series is.
+# The months come from the sources; the 0.25 and 0.5 levels are assumptions.
+MIGRATORY_ARRIVAL_PROFILE: tuple[float, ...] = (
+    0.5, 0.5, 0.5, 0.25, 0.0, 0.0, 0.0, 0.25, 1.0, 1.0, 1.0, 0.5
+)  # fmt: skip
+MIGRATORY_SITES_CSV = Path(__file__).with_name("reference") / "migracao_sitios_pe.csv"
+# A documented site lands flocks at its nearest mapped water point. Farther
+# than this, that water is another place, and flocks land at water anywhere in
+# the site's municipality instead. Coroa do Avião, an islet in the channel
+# mouth, is ~650 m from mapped water in the Pernambuco world; 3 km tolerates
+# coarser maps while staying well below the size of the municipalities.
+SITE_ANCHOR_MAX_M = 3_000.0
 # Farm introduction pathways counted per day in the history rows.
 INTRODUCTION_EVENTS = (
     "INTRODUCAO_FOMITE",
@@ -92,13 +119,81 @@ class Event(NamedTuple):
 
 
 class FlockArrival(NamedTuple):
-    """A migratory flock landing at (lon, lat); infected flocks carry one I bird."""
+    """A migratory flock landing at (lon, lat); infected flocks carry one I bird.
+
+    ``site`` names the documented landing site, or is None for a flock landed
+    by the size-weighted water draw.
+    """
 
     day: int
     lon: float
     lat: float
     size: int
     infected: bool
+    site: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class MigratorySite:
+    """A documented migratory landing site in Pernambuco.
+
+    ``location`` is None when no source gives a coordinate; flocks then land at
+    mapped water inside the municipality.
+    """
+
+    name: str
+    municipality_code: str
+    location: tuple[float, float] | None
+    weight: float
+
+
+def load_migratory_sites(
+    path: str | Path = MIGRATORY_SITES_CSV,
+) -> tuple[MigratorySite, ...]:
+    """Sites of the versioned reference table, in file order.
+
+    Raises ValueError naming the line of a row with a missing name, a
+    non-Pernambuco municipality code, a lone longitude or latitude, invalid
+    coordinates or a nonpositive weight.
+    """
+    path = Path(path)
+    sites = []
+    with path.open(newline="", encoding="utf-8") as fh:
+        for line, row in enumerate(csv.DictReader(fh), start=2):
+            try:
+                name = row["nome"].strip()
+                code = row["codigo_ibge"].strip()
+                lon, lat = row["lon"].strip(), row["lat"].strip()
+                weight = float(row["peso"])
+                if not name:
+                    raise ValueError("missing site name")
+                if len(code) != 7 or not code.startswith("26") or not code.isdigit():
+                    raise ValueError(f"non-Pernambuco municipality code {code!r}")
+                if bool(lon) != bool(lat):
+                    raise ValueError("lon and lat must be given together")
+                if not (math.isfinite(weight) and weight > 0):
+                    raise ValueError("weight must be positive")
+                location = lon_lat((lon, lat)) if lon else None
+            except (KeyError, ValueError) as exc:
+                raise ValueError(f"{path.name} line {line}: {exc}") from exc
+            sites.append(MigratorySite(name, code, location, weight))
+    return tuple(sites)
+
+
+def _water_weight(geometry_metric) -> float:
+    """Arrival weight of a metric water geometry (see AgentModel._water_sites)."""
+    if geometry_metric.area > 0:
+        return geometry_metric.area
+    return geometry_metric.length * NOMINAL_WATERLINE_WIDTH_M
+
+
+def _simple_parts(geometry) -> list:
+    """Polygon and line parts of a (multi-part or collection) geometry."""
+    if geometry.is_empty:
+        return []
+    if hasattr(geometry, "geoms"):
+        return [part for child in geometry.geoms for part in _simple_parts(child)]
+    return [geometry] if geometry.geom_type in ("Polygon", "LineString") else []
 
 
 @dataclass(slots=True)
@@ -180,6 +275,7 @@ class AgentModel(WorldModel):
         # Provenance of every farm introduction, in event order.
         self.transmissions: list[Transmission] = []
         self.flock_arrivals: list[FlockArrival] = []
+        self.migratory_sites: tuple[MigratorySite, ...] = load_migratory_sites()
         # Official protocol: confirmed foci in confirmation order, and notified
         # farms awaiting confirmation as (due day, farm) in notification order.
         self.foci: list[Focus] = []
@@ -205,6 +301,13 @@ class AgentModel(WorldModel):
         self._bird_serial = 0
         self._state_metric = None
         self._water_cache: tuple[list, np.ndarray] | None = None
+        # Usable documented sites with their fixed landing point (None: water
+        # in the municipality) and cumulative weights; water per municipality.
+        self._site_cache: (
+            tuple[list[tuple[MigratorySite, tuple[float, float] | None]], np.ndarray]
+            | None
+        ) = None
+        self._municipal_water: dict[str, tuple[list, np.ndarray]] = {}
         # Projected farm coordinates and KD-tree, rebuilt when farms change.
         self._farm_xy: np.ndarray | None = None
         self._farm_tree: cKDTree | None = None
@@ -365,12 +468,7 @@ class AgentModel(WorldModel):
                 hydro.spatial.geometry_to_metric(feature.geometry_wgs84)
                 for feature in hydro.features
             ]
-            weights = np.array(
-                [
-                    g.area if g.area > 0 else g.length * NOMINAL_WATERLINE_WIDTH_M
-                    for g in geometries
-                ]
-            )
+            weights = np.array([_water_weight(g) for g in geometries])
             self._water_cache = (geometries, np.cumsum(weights))
         return self._water_cache
 
@@ -379,10 +477,20 @@ class AgentModel(WorldModel):
         hydro = self.world.hydro
         if hydro is None or not hydro.features:
             return None
-        geometries, cumulative = self._water_sites()
-        if cumulative[-1] <= 0:
+        return self._sample_water_point(
+            *self._water_sites(), self.world.administrative.state_geometry_wgs84
+        )
+
+    def _sample_water_point(
+        self, geometries: list, cumulative: np.ndarray, region_wgs84
+    ) -> tuple[float, float] | None:
+        """A point on a size-weighted pick of metric water `geometries`.
+
+        None when there is no water or 20 picks all fall outside `region_wgs84`.
+        """
+        if not len(cumulative) or cumulative[-1] <= 0:
             return None
-        state = self.world.administrative.state_geometry_wgs84
+        hydro = self.world.hydro
         for _ in range(20):
             index = int(
                 np.searchsorted(cumulative, self.random.random() * cumulative[-1])
@@ -396,9 +504,133 @@ class AgentModel(WorldModel):
             else:
                 point = geometry.interpolate(self.random.random() * geometry.length)
             location = hydro.spatial.unproject((point.x, point.y))
-            if state.covers(Point(location)):
+            if region_wgs84.covers(Point(location)):
                 return location
         return None
+
+    def _landing_sites(
+        self,
+    ) -> tuple[list[tuple[MigratorySite, tuple[float, float] | None]], np.ndarray]:
+        """Documented sites usable in this world, resolved once and cached.
+
+        A site with a coordinate lands flocks at its nearest mapped water point
+        (the coordinate itself without hydrology) when that lies in the state
+        within SITE_ANCHOR_MAX_M; otherwise, or without a coordinate, at water
+        in its municipality. Sites whose municipality is not in the world are
+        dropped. Every fallback is logged as AVISO_AVES.
+        """
+        if self._site_cache is None:
+            codes = {m.code for m in self.world.administrative.municipalities}
+            usable: list[tuple[MigratorySite, tuple[float, float] | None]] = []
+            for site in self.migratory_sites:
+                if site.municipality_code not in codes:
+                    self.log_event(
+                        "AVISO_AVES",
+                        f"Sítio migratório {site.name} ignorado: município "
+                        f"{site.municipality_code} fora do mundo",
+                    )
+                    continue
+                anchor = None
+                if site.location is not None:
+                    anchor = self._site_anchor(site.location)
+                    if anchor is None:
+                        self.log_event(
+                            "AVISO_AVES",
+                            f"Sítio migratório {site.name}: sem água mapeada no "
+                            f"estado a até {SITE_ANCHOR_MAX_M / 1000:g} km; pouso "
+                            "em água do município",
+                        )
+                usable.append((site, anchor))
+            if self.migratory_sites and not usable:
+                self.log_event(
+                    "AVISO_AVES",
+                    "Nenhum sítio migratório conhecido no mundo: todos os bandos "
+                    "pousam pelo sorteio por tamanho do corpo d'água",
+                )
+            weights = np.array([site.weight for site, _ in usable])
+            self._site_cache = (usable, np.cumsum(weights))
+        return self._site_cache
+
+    def _site_anchor(self, location: tuple[float, float]) -> tuple[float, float] | None:
+        """Nearest mapped water point to `location` if in the state and near it."""
+        hydro = self.world.hydro
+        candidate: tuple[float, float] | None = location
+        if hydro is not None and hydro.features:
+            sp = hydro.spatial
+            origin = Point(sp.project(location))
+            best = None
+            # The hydro layer answers lines and bodies separately; keep the
+            # nearer of the two.
+            for feature in (
+                hydro.nearest_waterway(location),
+                hydro.nearest_waterbody(location),
+            ):
+                if feature is None:
+                    continue
+                geometry = sp.geometry_to_metric(feature.geometry_wgs84)
+                if geometry.is_empty:
+                    continue
+                closest = nearest_points(geometry, origin)[0]
+                distance = closest.distance(origin)
+                if best is None or distance < best[0]:
+                    best = (distance, closest)
+            candidate = None if best is None else sp.unproject((best[1].x, best[1].y))
+        state = self.world.administrative.state_geometry_wgs84
+        if (
+            candidate is None
+            or not state.covers(Point(candidate))
+            or self.distance_m(location, candidate) > SITE_ANCHOR_MAX_M
+        ):
+            return None
+        return candidate
+
+    def _municipal_water_point(self, code: str) -> tuple[float, float] | None:
+        """A size-weighted point on mapped water inside a municipality.
+
+        Without mapped water there, a uniform point in the municipality, as
+        state-wide arrivals do without hydrology.
+        """
+        admin = self.world.administrative
+        municipality = next(m for m in admin.municipalities if m.code == code)
+        if code not in self._municipal_water:
+            hydro = self.world.hydro
+            geometries = []
+            for feature in () if hydro is None else hydro.features:
+                if code in feature.municipality_codes:
+                    clipped = feature.geometry_wgs84.intersection(
+                        municipality.geometry_wgs84
+                    )
+                    geometries.extend(
+                        hydro.spatial.geometry_to_metric(part)
+                        for part in _simple_parts(clipped)
+                    )
+            weights = np.array([_water_weight(g) for g in geometries])
+            self._municipal_water[code] = (geometries, np.cumsum(weights))
+        point = self._sample_water_point(
+            *self._municipal_water[code], municipality.geometry_wgs84
+        )
+        if point is None:
+            sampled = sample_point_in(
+                admin.spatial.geometry_to_metric(municipality.geometry_wgs84),
+                self.random.uniform,
+            )
+            if sampled is not None:
+                point = admin.spatial.unproject((sampled.x, sampled.y))
+        return point
+
+    def _documented_site_point(self) -> tuple[str, tuple[float, float]] | None:
+        """A weighted documented site and its landing point, or None if none."""
+        sites, cumulative = self._landing_sites()
+        if not sites:
+            return None
+        index = int(
+            np.searchsorted(
+                cumulative, self.random.random() * cumulative[-1], side="right"
+            )
+        )
+        site, anchor = sites[min(index, len(sites) - 1)]
+        point = anchor or self._municipal_water_point(site.municipality_code)
+        return None if point is None else (site.name, point)
 
     def add_birds_uniform(self, n: int) -> int:
         """Place `n` resident birds uniformly inside the PE state polygon.
@@ -686,12 +918,34 @@ class AgentModel(WorldModel):
                 )
 
     def _bird_arrivals(self) -> None:
-        """Migratory flocks land at water (anywhere in the state without hydro)."""
+        """Migratory flocks land at water (anywhere in the state without hydro).
+
+        The day's rate follows MIGRATORY_ARRIVAL_PROFILE for the current month.
+        A ``migratory_site_fraction`` share of flocks lands at the documented
+        sites, by weight; the rest, and all of them when no site is usable,
+        land at size-weighted water.
+        """
         p = self.params
         sp = self.world.spatial
         state = self.world.administrative.state_geometry_wgs84
-        for _ in range(int(self.rng.poisson(p.migratory_flocks_per_day))):
-            site = self._random_water_point() or self._random_state_point()
+        rate = (
+            p.migratory_flocks_per_day
+            * MIGRATORY_ARRIVAL_PROFILE[self.current_date.month - 1]
+        )
+        for _ in range(int(self.rng.poisson(rate))):
+            documented = None
+            # A zero fraction draws nothing, so the size-weighted draw keeps
+            # its random stream.
+            if (
+                p.migratory_site_fraction > 0
+                and self.random.random() < p.migratory_site_fraction
+            ):
+                documented = self._documented_site_point()
+            if documented is not None:
+                site_name, site = documented
+            else:
+                site_name = None
+                site = self._random_water_point() or self._random_state_point()
             if site is None:
                 self.log_event("AVISO_AVES", "Sem ponto para chegada migratória")
                 return
@@ -699,7 +953,9 @@ class AgentModel(WorldModel):
             infected = self.random.random() * 100 < p.migratory_infected_pct
             size = 1 + int(self.rng.poisson(max(p.flock_size_mean - 1.0, 0.0)))
             self.flock_arrivals.append(
-                FlockArrival(self.day_count, site[0], site[1], size, infected)
+                FlockArrival(
+                    self.day_count, site[0], site[1], size, infected, site_name
+                )
             )
             x, y = sp.project(site)
             for k in range(size):
@@ -716,9 +972,10 @@ class AgentModel(WorldModel):
                 if infected and k == 0:
                     bird.infect()
             if infected:
+                where = f" em {site_name}" if site_name else ""
                 self.log_event(
                     "CHEGADA_BANDO_INFECTADO",
-                    f"Bando migratório de {size} aves chegou com ave infectada",
+                    f"Bando migratório de {size} aves chegou com ave infectada{where}",
                 )
 
     def _bird_transmission(self) -> None:

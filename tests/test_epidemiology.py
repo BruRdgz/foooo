@@ -8,17 +8,50 @@ import pytest
 if importlib.util.find_spec("mesa") is None:
     pytest.skip("Requires the optional simulation extra", allow_module_level=True)
 
+from shapely.geometry import LineString, Point, box
+
 from simgeope.simulation import AgentModel, ModelParams
 from simgeope.simulation.agents import local_spread_prob
-from simgeope.simulation.model import dominant_source, install_synthetic_facilities
+from simgeope.simulation.model import (
+    FLOCK_SPREAD_M,
+    MIGRATORY_ARRIVAL_PROFILE,
+    MigratorySite,
+    dominant_source,
+    install_synthetic_facilities,
+    load_migratory_sites,
+)
 from simgeope.world.facilities import Facility
+from simgeope.world.hydro import HydroFeature, HydroLayer
 
 # Birds stay put and never leave, and nobody arrives, unless a test says so.
 STILL = dict(bird_step_m=0.0, bird_mean_stay_days=1e9, migratory_flocks_per_day=0)
+RECIFE = "2611606"  # the tiny world's mainland municipality
 
 
 def _model(world, **params):
     return AgentModel(world, params=ModelParams(**(STILL | params)), seed=3)
+
+
+def _add_water(world):
+    """A north-south river at lon -34.995 and a pond in the east of Recife."""
+    world.hydro = HydroLayer(
+        [
+            HydroFeature(
+                "river",
+                "river",
+                LineString([(-34.995, -8.015), (-34.995, -7.995)]),
+                municipality_codes=(RECIFE,),
+            ),
+            HydroFeature(
+                "pond",
+                "pond",
+                box(-34.985, -8.012, -34.975, -8.004),
+                municipality_codes=(RECIFE,),
+            ),
+        ],
+        world.config.metric_crs,
+    )
+    return world
 
 
 @pytest.mark.parametrize(
@@ -68,6 +101,8 @@ def test_migratory_flocks_arrive_inside_state_and_depart(tiny_world):
         flock_size_mean=4,
         migratory_infected_pct=100.0,
         bird_mean_stay_days=1.0,  # every bird leaves on its next step
+        start_month=10,  # peak month: the full daily rate
+        bird_to_bird_prob=0.0,  # only index birds are infected
     )
     model.step()
     arrived = list(model.birds)
@@ -82,6 +117,114 @@ def test_migratory_flocks_arrive_inside_state_and_depart(tiny_world):
     assert all(f.day == 1 and f.infected for f in flocks)
     model.step()
     assert not set(arrived) & set(model.birds)
+
+
+@pytest.mark.parametrize(
+    "start_month,days,arrives",
+    [
+        # Day d is start_month's day d + 1: each run covers the rest of the month.
+        (5, 30, False),
+        (6, 29, False),
+        (7, 30, False),
+        (9, 1, True),
+        (10, 1, True),
+    ],
+)
+def test_migratory_arrivals_follow_the_monthly_profile(
+    tiny_world, start_month, days, arrives
+):
+    # The slider is the peak-month rate.
+    assert len(MIGRATORY_ARRIVAL_PROFILE) == 12
+    assert max(MIGRATORY_ARRIVAL_PROFILE) == 1.0
+    model = _model(tiny_world, migratory_flocks_per_day=20, start_month=start_month)
+    model.run(days)
+    assert model.current_date.month == start_month
+    assert (model.flocks_arrived > 0) is arrives
+
+
+def test_documented_sites_land_flocks_on_nearby_water_in_the_state(tiny_world):
+    model = _model(
+        _add_water(tiny_world),
+        migratory_flocks_per_day=40,
+        start_month=10,
+        migratory_site_fraction=1.0,
+    )
+    model.migratory_sites = (
+        MigratorySite("Lagoa", RECIFE, (-34.98, -8.008), 1.0),  # inside the pond
+        MigratorySite("Margem", RECIFE, (-34.993, -8.0), 1.0),  # ~220 m off the river
+        # ~3.9 km east of the pond, outside the state: lands at Recife's water.
+        MigratorySite("Longe", RECIFE, (-34.94, -8.0), 1.0),
+        MigratorySite("Sem coordenada", RECIFE, None, 1.0),
+        MigratorySite("Fora do mundo", "2600054", None, 1e6),
+    )
+    model.step()
+    by_site = {}
+    for flock in model.flock_arrivals:
+        by_site.setdefault(flock.site, []).append((flock.lon, flock.lat))
+    assert set(by_site) == {"Lagoa", "Margem", "Longe", "Sem coordenada"}
+    for site, anchor in [("Lagoa", (-34.98, -8.008)), ("Margem", (-34.995, -8.0))]:
+        for lon, lat in by_site[site]:
+            assert (lon, lat) == pytest.approx(anchor, abs=1e-6)
+    for lon, lat in by_site["Longe"] + by_site["Sem coordenada"]:
+        assert tiny_world.hydro.distance_to_water((lon, lat)) < 1.0
+        assert tiny_world.municipality_at((lon, lat)).code == RECIFE
+    state = tiny_world.administrative.state_geometry_wgs84
+    landings = [(f.lon, f.lat) for f in model.flock_arrivals]
+    assert model.birds
+    for bird in model.birds:
+        assert state.covers(Point(bird.location))
+        # Flock members scatter FLOCK_SPREAD_M (1 sigma) around their landing.
+        assert min(model.distance_m(bird.location, s) for s in landings) < (
+            5 * FLOCK_SPREAD_M
+        )
+    warnings = " ".join(e.details for e in model.events if e.kind == "AVISO_AVES")
+    assert "Fora do mundo" in warnings and "Longe" in warnings
+
+
+def test_zero_site_fraction_keeps_size_weighted_arrivals(tiny_world):
+    """Arrivals recorded before documented sites existed (same seed and world)."""
+    params = ModelParams(
+        **STILL
+        | {
+            "migratory_flocks_per_day": 4.0,
+            "flock_size_mean": 3.0,
+            "migratory_infected_pct": 50.0,
+            "start_month": 10,  # profile 1: the pre-profile rate
+            "migratory_site_fraction": 0.0,
+        }
+    )
+    model = AgentModel(_add_water(tiny_world), params=params, seed=11)
+    model.run(2)
+    assert [tuple(f) for f in model.flock_arrivals] == [
+        pytest.approx(expected)
+        for expected in [
+            (1, -34.97980580875277, -8.010421238901023, 3, True, None),
+            (1, -34.97950647972904, -8.0042038289688, 1, True, None),
+            (2, -34.98069996470407, -8.005669848537533, 5, True, None),
+            (2, -34.97822757089576, -8.011496985177255, 3, True, None),
+            (2, -34.97934421821516, -8.009454371660697, 3, False, None),
+            (2, -34.99500001404442, -8.012935325742644, 4, True, None),
+            (2, -34.98383508657752, -8.006434237442956, 2, False, None),
+            (2, -34.97515566466907, -8.004681189362433, 1, True, None),
+        ]
+    ]
+
+
+@pytest.mark.parametrize(
+    "row,message",
+    [
+        ("Sítio,2611606,-34.9,,1", "together"),
+        ("Sítio,2911606,,,1", "municipality code"),
+        ("Sítio,2611606,,,0", "positive"),
+        ("Sítio,2611606,-200,-8,1", "WGS84"),
+    ],
+)
+def test_migratory_site_table_rejects_invalid_rows(tmp_path, row, message):
+    assert load_migratory_sites()  # the shipped table is valid
+    path = tmp_path / "sitios.csv"
+    path.write_text(f"nome,codigo_ibge,lon,lat,peso\n{row}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match=f"line 2: .*{message}"):
+        load_migratory_sites(path)
 
 
 @pytest.mark.parametrize(

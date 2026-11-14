@@ -19,6 +19,7 @@ from simgeope.simulation import AgentModel, ModelParams, infection_risk
 from simgeope.simulation.agents import HUB_PRODUCTS, ZONE_RINGS, Transmission
 from simgeope.simulation.model import (
     DEFAULT_FARM_POPULATION,
+    MIGRATORY_ARRIVAL_PROFILE,
     Event,
     install_official_facilities,
 )
@@ -810,20 +811,31 @@ def add_simulation_routes(app, session: SimulationSession) -> None:
 
     @app.get("/api/sim/flocks")
     def flocks(from_day: int | None = None, to_day: int | None = None):
-        """Migratory flock arrivals in the window (default: today only)."""
+        """Migratory flock arrivals in the window (default: today only).
+
+        ``site`` names the documented landing site (None: size-weighted water
+        draw); ``arrival_profile`` is the monthly share of the peak arrival
+        rate, January first.
+        """
         check_window(from_day, to_day)
         with session.lock:
             model = session.model
             high = model.day_count if to_day is None else to_day
             low = high if from_day is None else from_day
-            return _collection(
+            collection = _collection(
                 (
                     Point(flock.lon, flock.lat),
-                    {"day": flock.day, "size": flock.size, "infected": flock.infected},
+                    {
+                        "day": flock.day,
+                        "size": flock.size,
+                        "infected": flock.infected,
+                        "site": flock.site,
+                    },
                 )
                 for flock in model.flock_arrivals
                 if low <= flock.day <= high
             )
+            return dict(collection, arrival_profile=list(MIGRATORY_ARRIVAL_PROFILE))
 
     @app.get("/api/sim/history")
     def history():

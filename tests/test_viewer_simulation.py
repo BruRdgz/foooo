@@ -164,9 +164,9 @@ def test_param_schema_covers_every_scalar_model_parameter(client):
         "Protocolo oficial (MAPA 2023)",
     ]
     # Every entry says whether its value is an assumption and where it comes
-    # from. Protocol values, and the mortality suspicion of the surveillance
-    # group, are cited from an official MAPA document or flagged as
-    # assumptions; production values carry a source or an assumption flag.
+    # from. Assumptions explain the guess; protocol values, and the mortality
+    # suspicion of the surveillance group, cite an official MAPA document;
+    # production values cite their source; other groups have no source.
     official = ("POP", "Plano de Contingência", "Ficha Técnica", "planilha MAPA")
     cited = {
         "mortality_notification",
@@ -176,17 +176,19 @@ def test_param_schema_covers_every_scalar_model_parameter(client):
     for spec in body["schema"]:
         assert type(spec["assumption"]) is bool
         needs_official = spec["group"] == groups[-1] or spec["name"] in cited
-        if not needs_official and spec["group"] != "Produção e mercados":
-            assert (spec["assumption"], spec["source"]) == (False, None)
-        elif spec["assumption"]:
+        if spec["assumption"]:
             assert spec["source"].startswith("suposição: ")
         elif needs_official:
             assert any(name in spec["source"] for name in official)
-        else:
+        elif spec["group"] == "Produção e mercados":
             assert spec["source"]
+        else:
+            assert spec["source"] is None
     protocol = {s["name"]: s for s in body["schema"] if s["group"] == groups[-1]}
     assert not protocol["surveillance_radius_km"]["assumption"]
     assert protocol["zone_release_days"]["assumption"]
+    birds = {s["name"]: s for s in body["schema"] if s["group"] == "Aves silvestres"}
+    assert birds["migratory_site_fraction"]["assumption"]
 
 
 def test_reset_param_overrides_persist_across_resets(client, session):
@@ -300,10 +302,13 @@ def test_farm_detail_combines_history_events_and_visits(client):
 def test_events_filter_by_farm_and_type_keeps_log_cursor(client):
     client.post("/api/sim/step", json={"days": 2})
     full = client.get("/api/sim/events").json()
-    assert all(e["farm_id"] == "b" for e in full["events"])  # no fleet warnings
+    assert not [e for e in full["events"] if e["type"] == "AVISO_FROTA"]
+    # Model-wide events (e.g. migratory site warnings) have no farm.
+    farm_events = [e for e in full["events"] if e["farm_id"] is not None]
+    assert farm_events and all(e["farm_id"] == "b" for e in farm_events)
 
     for query, expected in [
-        ({"farm_id": "b"}, full["events"]),
+        ({"farm_id": "b"}, farm_events),
         ({"farm_id": "zz"}, []),
         (
             {"type": "INTRODUCAO_INICIAL"},
@@ -602,14 +607,14 @@ def test_heat_omits_farms_without_any_value(chain):
 
 
 def test_flocks_filter_arrivals_by_day(client, session):
-    from simgeope.simulation.model import FlockArrival
+    from simgeope.simulation.model import MIGRATORY_ARRIVAL_PROFILE, FlockArrival
 
     client.post("/api/sim/step", json={"days": 3})
     session.model.flock_arrivals = [
-        FlockArrival(0, -35.0, -8.0, 4, False),
-        FlockArrival(1, -34.99, -8.0, 7, True),
-        FlockArrival(1, -34.98, -8.0, 2, False),
-        FlockArrival(3, -35.0, -8.01, 9, True),
+        FlockArrival(0, -35.0, -8.0, 4, False, None),
+        FlockArrival(1, -34.99, -8.0, 7, True, "Lagoa do Araçá"),
+        FlockArrival(1, -34.98, -8.0, 2, False, None),
+        FlockArrival(3, -35.0, -8.01, 9, True, "Parque dos Manguezais"),
     ]
 
     for query, expected in [
@@ -628,8 +633,21 @@ def test_flocks_filter_arrivals_by_day(client, session):
             )
             for f in features
         ] == expected
-    (flock,) = client.get("/api/sim/flocks").json()["features"]
+    today = client.get("/api/sim/flocks").json()
+    (flock,) = today["features"]
     assert flock["geometry"] == {"type": "Point", "coordinates": [-35.0, -8.01]}
+    assert flock["properties"]["site"] == "Parque dos Manguezais"
+    assert today["arrival_profile"] == list(MIGRATORY_ARRIVAL_PROFILE)
+    (first, _) = client.get(
+        "/api/sim/flocks", params={"from_day": 1, "to_day": 1}
+    ).json()["features"]
+    assert first["properties"]["site"] == "Lagoa do Araçá"
+    assert (
+        client.get("/api/sim/flocks", params={"to_day": 0}).json()["features"][0][
+            "properties"
+        ]["site"]
+        is None
+    )
     bad = client.get("/api/sim/flocks", params={"from_day": 2, "to_day": 1})
     assert bad.status_code == 422
 

@@ -67,11 +67,15 @@ class ModelParams:
     bird_contact_km: float = 1.0
     # Spillback: wild birds near an infected farm (within bird_farm_proximity_km).
     farm_to_bird_prob: float = 5.0  # %
-    # Migratory flow: flocks land together at size-weighted water sites
-    # (Poisson events, 1 + Poisson(flock_size_mean - 1) birds) and each bird
-    # stays a geometric time, so the population settles near
-    # flocks x size x stay. An infected flock carries one infected index bird.
+    # Migratory flow: flocks land together at water sites (Poisson events,
+    # 1 + Poisson(flock_size_mean - 1) birds) and each bird stays a geometric
+    # time, so the population settles near flocks x size x stay. An infected
+    # flock carries one infected index bird. The daily rate is the peak-month
+    # rate, scaled by the month's MIGRATORY_ARRIVAL_PROFILE entry (model.py).
     migratory_flocks_per_day: float = 0.3
+    # Share of flocks landing at the documented Pernambuco sites
+    # (reference/migracao_sitios_pe.csv); the rest land at size-weighted water.
+    migratory_site_fraction: float = 0.5
     flock_size_mean: float = 8.0
     migratory_infected_pct: float = 15.0  # % dos bandos
     bird_mean_stay_days: float = 30.0
@@ -342,7 +346,27 @@ PARAM_SPECS: tuple[ParamSpec, ...] = (
         "farm_to_bird_prob", "Infecção granja → ave por dia", _BIRDS, 0, 100, 1, "%"
     ),
     ParamSpec(
-        "migratory_flocks_per_day", "Bandos migratórios por dia", _BIRDS, 0, 1, 0.1
+        "migratory_flocks_per_day",
+        "Bandos migratórios por dia no pico (set–nov)",
+        _BIRDS,
+        0,
+        1,
+        0.1,
+        assumption=True,
+        source="suposição: taxa ilustrativa no mês de pico; o perfil mensal que "
+        "a reduz nos outros meses segue Azevedo Jr. 1992 (Coroa do Avião, "
+        "limícolas árticas de agosto a abril) e CEMAVE (chegada em setembro)",
+    ),
+    ParamSpec(
+        "migratory_site_fraction",
+        "Fração dos bandos nos sítios de pouso conhecidos",
+        _BIRDS,
+        0,
+        1,
+        0.05,
+        assumption=True,
+        source="suposição: metade dos bandos pousa nos sítios documentados em PE "
+        "(CEMAVE; Azevedo Jr. 1992); o resto representa sítios não inventariados",
     ),
     ParamSpec("flock_size_mean", "Tamanho médio do bando", _BIRDS, 1, 20, 1),
     ParamSpec(
